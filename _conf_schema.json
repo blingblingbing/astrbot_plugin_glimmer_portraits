@@ -1,0 +1,234 @@
+{
+  "enabled": {
+    "description": "启用群画像",
+    "type": "bool",
+    "default": true,
+    "hint": "仅处理群聊，不处理私聊。"
+  },
+  "group_whitelist": {
+    "description": "启用群白名单",
+    "type": "list",
+    "default": ["*"],
+    "hint": "填写 * 表示全部群；填写群号则只处理指定群。空列表也表示全部群。"
+  },
+  "group_blacklist": {
+    "description": "禁用群黑名单",
+    "type": "list",
+    "default": [],
+    "hint": "黑名单优先于白名单。"
+  },
+  "summary_provider_id": {
+    "description": "画像总结使用的模型",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "从 AstrBot 已配置的 Provider 中选择；留空使用默认 Provider。该模型只用于画像总结，不影响正常聊天模型。"
+  },
+  "auto_update_enabled": {
+    "description": "启用按消息量自动总结",
+    "type": "bool",
+    "default": true,
+    "hint": "累计达到阈值后按群批量总结一次。"
+  },
+  "summary_every_n_messages": {
+    "description": "自动总结消息阈值",
+    "type": "int",
+    "default": 80,
+    "min": 5,
+    "max": 2000,
+    "hint": "按当前群的新增消息数量计算，不按用户拆分。"
+  },
+  "daily_summary_enabled": {
+    "description": "启用每日定时总结",
+    "type": "bool",
+    "default": true
+  },
+  "daily_summary_hour": {
+    "description": "每日总结时间（小时）",
+    "type": "int",
+    "default": 3,
+    "min": 0,
+    "max": 23,
+    "hint": "使用 AstrBot 所在机器的本地时间。"
+  },
+  "daily_min_messages": {
+    "description": "每日总结最少消息数",
+    "type": "int",
+    "default": 20,
+    "min": 1,
+    "max": 2000
+  },
+  "summary_batch_messages": {
+    "description": "单次总结最大消息数",
+    "type": "int",
+    "default": 120,
+    "min": 10,
+    "max": 1000,
+    "hint": "消息仍按群聊时间顺序提供给模型，不会按用户切割。"
+  },
+  "summary_max_prompt_chars": {
+    "description": "总结请求最大字符数",
+    "type": "int",
+    "default": 24000,
+    "min": 4000,
+    "max": 100000
+  },
+  "summary_timeout_seconds": {
+    "description": "总结模型超时时间（秒）",
+    "type": "int",
+    "default": 90,
+    "min": 10,
+    "max": 600
+  },
+  "enabled_fields": {
+    "description": "启用的画像字段",
+    "type": "list",
+    "default": [
+      "称呼与别名",
+      "兴趣爱好",
+      "游戏偏好",
+      "职业或学习方向",
+      "工作状态",
+      "技能与擅长领域",
+      "软件与设备偏好",
+      "饮食偏好",
+      "粗略地区或时区",
+      "沟通风格",
+      "群内关系",
+      "近期状态",
+      "自由观察"
+    ],
+    "hint": "固定字段白名单。活跃时段由本地统计产生，不由模型推断。"
+  },
+  "allow_sensitive_fields": {
+    "description": "允许敏感画像字段",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后仍只接受用户明确自述，不允许模型从聊天内容推断。"
+  },
+  "min_confidence": {
+    "description": "画像最低置信度",
+    "type": "float",
+    "default": 0.58,
+    "min": 0.0,
+    "max": 1.0,
+    "hint": "低于该值的模型结果不会写入数据库。"
+  },
+  "temporary_ttl_days": {
+    "description": "临时画像保留时间（天）",
+    "type": "int",
+    "default": 45,
+    "min": 0,
+    "max": 3650,
+    "hint": "工作状态、近期状态和关系观察等内容的过期时间；0 表示不过期。"
+  },
+  "observation_ttl_days": {
+    "description": "群内观察保留时间（天）",
+    "type": "int",
+    "default": 90,
+    "min": 0,
+    "max": 3650,
+    "hint": "沟通风格和自由观察等内容的过期时间；0 表示不过期。"
+  },
+  "max_facts_per_user": {
+    "description": "每用户最多保留事实数",
+    "type": "int",
+    "default": 12,
+    "min": 1,
+    "max": 100
+  },
+  "max_aliases_per_user": {
+    "description": "每用户最多保留称呼数",
+    "type": "int",
+    "default": 8,
+    "min": 1,
+    "max": 100
+  },
+  "max_observations_per_user": {
+    "description": "每用户最多保留观察数",
+    "type": "int",
+    "default": 5,
+    "min": 1,
+    "max": 100
+  },
+  "max_relations_per_user": {
+    "description": "每用户最多保留关系数",
+    "type": "int",
+    "default": 12,
+    "min": 1,
+    "max": 100
+  },
+  "profile_active_days": {
+    "description": "活跃画像时间范围（天）",
+    "type": "int",
+    "default": 30,
+    "min": 0,
+    "max": 3650
+  },
+  "enable_injection": {
+    "description": "启用画像注入",
+    "type": "bool",
+    "default": true
+  },
+  "injection_max_users": {
+    "description": "单次最多注入用户数",
+    "type": "int",
+    "default": 4,
+    "min": 1,
+    "max": 12,
+    "hint": "优先当前发言者，其次是 @对象和回复目标。"
+  },
+  "injection_max_chars_per_user": {
+    "description": "单用户画像最大注入字符数",
+    "type": "int",
+    "default": 500,
+    "min": 120,
+    "max": 3000
+  },
+  "injection_max_total_chars": {
+    "description": "单次画像注入总字符数",
+    "type": "int",
+    "default": 1400,
+    "min": 200,
+    "max": 12000
+  },
+  "overview_page_size": {
+    "description": "群画像概览显示人数",
+    "type": "int",
+    "default": 20,
+    "min": 1,
+    "max": 100
+  },
+  "allow_whole_group_reset": {
+    "description": "允许全群画像重置",
+    "type": "bool",
+    "default": false,
+    "hint": "危险操作。即使开启仍需要二次确认码。"
+  },
+  "reset_confirmation_ttl_seconds": {
+    "description": "重置确认码有效期（秒）",
+    "type": "int",
+    "default": 60,
+    "min": 10,
+    "max": 600
+  },
+  "capture_bot_messages": {
+    "description": "采集机器人消息",
+    "type": "bool",
+    "default": false,
+    "hint": "默认只采集群成员消息，避免 Bot 自己的回复污染画像。"
+  },
+  "max_pending_messages": {
+    "description": "待总结消息提醒阈值",
+    "type": "int",
+    "default": 2000,
+    "min": 100,
+    "max": 100000
+  },
+  "log_level": {
+    "description": "日志级别",
+    "type": "string",
+    "default": "INFO",
+    "options": ["DEBUG", "INFO", "WARNING"]
+  }
+}
