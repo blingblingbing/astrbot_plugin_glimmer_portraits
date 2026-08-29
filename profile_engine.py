@@ -343,11 +343,12 @@ def build_summary_prompt(
 1. 这是按时间顺序的多人群聊，不要按某个用户单独截取后臆测；同时利用上下文判断“谁在对谁说话”。
 2. 只有能明确归属到 uid 的内容才能更新该用户；没有证据就不要输出。
 3. 用户自述或明确表达优先；重复稳定偏好可以记录；沟通风格只能写成“在本群表现为……”的观察，不能生成绝对性格、MBTI 或诊断。
-4. 地区、饮食、职业等只接受主动透露的信息；{sensitive_rule}不得从语言、头像、时间或玩笑推断。
-5. 不要把当前平台昵称重复当成新别名；只有历史称呼、群友实际使用的称呼才放入 aliases。
-6. 每个事实必须给出 evidence_line_ids，且只能引用下面真实存在的 L 行；不能伪造行号。
-7. 对旧画像做去重和纠错：没有变化不要重复输出；发生明确变化时使用 replace 或 expire。replace 只在 value 已经包含该字段当前完整状态时使用。
-8. 只输出 JSON，不要解释，不要输出 Markdown 代码块，不要增加未列出的字段。
+4. 沟通风格是每位用户唯一的一条长期综合画像，不是本批聊天摘要。仅当本批至少两条消息共同提供稳定证据，且相较旧画像有实质新增或修正时输出；必须使用 replace，并把仍成立的旧特征和新特征合并为一条完整、精炼的描述。单次玩笑、一次问答、具体事件和临时情绪不得写入沟通风格；没有实质变化时不要输出。
+5. 地区、饮食、职业等只接受主动透露的信息；{sensitive_rule}不得从语言、头像、时间或玩笑推断。
+6. 不要把当前平台昵称重复当成新别名；只有历史称呼、群友实际使用的称呼才放入 aliases。
+7. 每个事实必须给出 evidence_line_ids，且只能引用下面真实存在的 L 行；不能伪造行号。
+8. 对旧画像做去重和纠错：没有变化不要重复输出；发生明确变化时使用 replace 或 expire。replace 只在 value 已经包含该字段当前完整状态时使用。
+9. 只输出 JSON，不要解释，不要输出 Markdown 代码块，不要增加未列出的字段。
 
 允许的画像字段：{field_text}
 
@@ -369,7 +370,7 @@ def build_summary_prompt(
     {{"from_user_id":"12345678","to_user_id":"22334455","relation_type":"称呼|游戏搭档|经常互动|其他","value":"简短描述","confidence":0.0,"evidence_line_ids":[2]}}
   ],
   "observations": [
-    {{"user_id":"12345678","field":"communication_style","value":"在本群表现为……","confidence":0.0,"evidence_line_ids":[3]}}
+    {{"user_id":"12345678","field":"communication_style","action":"replace","value":"在本群表现为……","confidence":0.0,"evidence_line_ids":[1,3]}}
   ]
 }}
 
@@ -633,15 +634,24 @@ def parse_model_result(
             )
 
     raw_observations = payload.get("observations", [])
+    communication_styles: dict[str, dict[str, Any]] = {}
     if isinstance(raw_observations, list):
         for item in raw_observations[:max_items]:
             if not isinstance(item, dict):
                 continue
             user_id = _target_user_id(item)
             field = normalize_field(item.get("field", "observations")) or "observations"
-            value = clean_text(item.get("value", item.get("description", "")), 160)
+            value_limit = 120 if field == "communication_style" else 160
+            value = clean_text(item.get("value", item.get("description", "")), value_limit)
             confidence = _confidence(item.get("confidence"))
             evidence_ids = _evidence_lines(item, by_id)
+            own_evidence_count = sum(
+                by_id[line_id].sender_id == user_id for line_id in evidence_ids
+            )
+            action = str(
+                item.get("action", "replace" if field == "communication_style" else "add")
+                or "add"
+            ).strip().lower()
             if (
                 not user_id
                 or user_id not in known_users
@@ -651,18 +661,33 @@ def parse_model_result(
                 or confidence is None
                 or confidence < min_confidence
                 or not evidence_ids
+                or (
+                    field == "communication_style"
+                    and (
+                        action != "replace"
+                        or confidence < max(min_confidence, 0.72)
+                        or own_evidence_count < 2
+                    )
+                )
             ):
                 continue
-            result["observations"].append(
-                {
-                    "user_id": user_id,
-                    "field": field,
-                    "value": value,
-                    "confidence": confidence,
-                    "evidence_line_ids": evidence_ids,
-                    "evidence": _evidence_text(evidence_ids, by_id),
-                }
-            )
+            parsed_observation = {
+                "user_id": user_id,
+                "field": field,
+                "action": action,
+                "value": value,
+                "confidence": confidence,
+                "evidence_line_ids": evidence_ids,
+                "evidence": _evidence_text(evidence_ids, by_id),
+            }
+            if field == "communication_style":
+                previous = communication_styles.get(user_id)
+                if previous is None or confidence > float(previous["confidence"]):
+                    communication_styles[user_id] = parsed_observation
+            else:
+                result["observations"].append(parsed_observation)
+
+    result["observations"].extend(communication_styles.values())
 
     return result
 

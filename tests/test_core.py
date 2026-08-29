@@ -134,6 +134,44 @@ class ProfileEngineTests(unittest.TestCase):
             [item["action"] for item in result["facts"]], ["replace", "add"]
         )
 
+    def test_communication_style_requires_repeated_evidence_and_replace(self) -> None:
+        messages = number_messages(
+            [
+                {
+                    "id": 1,
+                    "sender_id": "12345678",
+                    "sender_name": "小明",
+                    "text": "先简单说一句",
+                },
+                {
+                    "id": 2,
+                    "sender_id": "22334455",
+                    "sender_name": "小红",
+                    "text": "我来回应",
+                },
+                {
+                    "id": 3,
+                    "sender_id": "12345678",
+                    "sender_name": "小明",
+                    "text": "再接一个玩笑",
+                },
+            ]
+        )
+        raw = """
+        {
+          "observations": [
+            {"user_id":"12345678","field":"communication_style","action":"replace","value":"在本群表现为回复简洁，善于承接玩笑","confidence":0.85,"evidence_line_ids":[1,3]},
+            {"user_id":"22334455","field":"communication_style","action":"replace","value":"在本群表现为直接回应问题","confidence":0.9,"evidence_line_ids":[2]}
+          ]
+        }
+        """
+        result = parse_model_result(
+            raw, messages, ["communication_style"], min_confidence=0.5
+        )
+        self.assertEqual(len(result["observations"]), 1)
+        self.assertEqual(result["observations"][0]["action"], "replace")
+        self.assertEqual(result["observations"][0]["user_id"], "12345678")
+
 
 class ProfileStoreTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -268,6 +306,63 @@ class ProfileStoreTests(unittest.TestCase):
         self.assertLessEqual(len(text), 500)
         self.assertIn("摄影", text)
         self.assertIn("明哥", text)
+
+    def test_communication_style_replaces_previous_active_style(self) -> None:
+        values = ("在本群表现为回复简洁", "在本群表现为回复简洁且善于接梗")
+        for index, value in enumerate(values, 1):
+            result = {
+                "facts": [],
+                "aliases": [],
+                "relations": [],
+                "observations": [
+                    {
+                        "user_id": "12345678",
+                        "field": "communication_style",
+                        "action": "replace",
+                        "value": value,
+                        "confidence": 0.8 + index / 100,
+                        "evidence": "测试证据",
+                    }
+                ],
+            }
+            self.store.apply_result_and_consume("qq:100", [], result)
+
+        rows = self.store.connection.execute(
+            "SELECT value, status FROM observations WHERE scope=? AND user_id=? ORDER BY id",
+            ("qq:100", "12345678"),
+        ).fetchall()
+        self.assertEqual(sum(row["status"] == "active" for row in rows), 1)
+        self.assertEqual(
+            next(row["value"] for row in rows if row["status"] == "active"),
+            "在本群表现为回复简洁且善于接梗",
+        )
+
+    def test_existing_duplicate_communication_styles_collapse_on_reopen(self) -> None:
+        database_path = Path(self.temp_dir.name) / "profiles.sqlite3"
+        self.store.connection.execute("DROP INDEX idx_one_active_communication_style")
+        self.store.connection.executemany(
+            """
+            INSERT INTO observations
+            (scope, user_id, field, value, canonical_value, confidence, last_seen, status)
+            VALUES ('qq:100', '12345678', 'communication_style', ?, ?, ?, ?, 'active')
+            """,
+            [
+                ("旧的低置信风格", "旧的低置信风格", 0.7, 20),
+                ("应保留的高置信风格", "应保留的高置信风格", 0.9, 10),
+            ],
+        )
+        self.store.connection.commit()
+        self.store.close()
+        self.store = ProfileStore(database_path)
+
+        rows = self.store.connection.execute(
+            "SELECT value, status FROM observations ORDER BY id"
+        ).fetchall()
+        self.assertEqual(sum(row["status"] == "active" for row in rows), 1)
+        self.assertEqual(
+            next(row["value"] for row in rows if row["status"] == "active"),
+            "应保留的高置信风格",
+        )
 
 
 if __name__ == "__main__":

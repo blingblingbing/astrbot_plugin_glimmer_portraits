@@ -183,6 +183,43 @@ class ProfileStore:
             """
         )
         self.connection.commit()
+        self._collapse_communication_styles()
+        self.connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_communication_style
+            ON observations(scope, user_id)
+            WHERE field = 'communication_style' AND status = 'active'
+            """
+        )
+        self.connection.commit()
+
+    def _collapse_communication_styles(self) -> int:
+        """将旧版本累积的沟通风格收敛为每位用户一条活跃记录。"""
+
+        rows = self.connection.execute(
+            """
+            SELECT id, scope, user_id
+            FROM observations
+            WHERE field = 'communication_style' AND status = 'active'
+            ORDER BY scope, user_id, confidence DESC, last_seen DESC, id DESC
+            """
+        ).fetchall()
+        seen: set[tuple[str, str]] = set()
+        archive_ids: list[int] = []
+        for row in rows:
+            key = (str(row["scope"]), str(row["user_id"]))
+            if key in seen:
+                archive_ids.append(int(row["id"]))
+            else:
+                seen.add(key)
+        if archive_ids:
+            placeholders = ",".join("?" for _ in archive_ids)
+            self.connection.execute(
+                f"UPDATE observations SET status='archived' WHERE id IN ({placeholders})",
+                archive_ids,
+            )
+            self.connection.commit()
+        return len(archive_ids)
 
     def add_message(
         self,
@@ -986,6 +1023,17 @@ class ProfileStore:
         if not user_id or not value:
             return
         expires_at = now + observation_ttl_days * 86400 if observation_ttl_days else 0
+        if field == "communication_style":
+            # 沟通风格是完整状态而非可无限追加的事件列表。先归档旧状态，
+            # 随后的 upsert 会将同文案重新激活，或插入新的替代状态。
+            cursor.execute(
+                """
+                UPDATE observations SET status='archived'
+                WHERE scope = ? AND user_id = ? AND field = 'communication_style'
+                  AND status = 'active'
+                """,
+                (scope, user_id),
+            )
         cursor.execute(
             """
             INSERT INTO observations
