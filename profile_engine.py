@@ -270,7 +270,7 @@ def _render_old_profiles(old_profiles: Mapping[str, Mapping[str, Any]], max_char
                 {
                     "name": clean_text(item.get("alias", ""), 24),
                     "source": item.get("source", "observed"),
-                    "called_by_user_id": item.get("called_by_user_id", ""),
+                    "called_by_user_ids": item.get("called_by_user_ids", []),
                 }
                 for item in profile.get("aliases", [])
                 if item.get("status", "active") == "active"
@@ -345,10 +345,12 @@ def build_summary_prompt(
 3. 用户自述或明确表达优先；重复稳定偏好可以记录；沟通风格只能写成“在本群表现为……”的观察，不能生成绝对性格、MBTI 或诊断。
 4. 沟通风格是每位用户唯一的一条长期综合画像，不是本批聊天摘要。仅当本批至少两条消息共同提供稳定证据，且相较旧画像有实质新增或修正时输出；必须使用 replace，并把仍成立的旧特征和新特征合并为一条完整、精炼的描述。单次玩笑、一次问答、具体事件和临时情绪不得写入沟通风格；没有实质变化时不要输出。
 5. 地区、饮食、职业等只接受主动透露的信息；{sensitive_rule}不得从语言、头像、时间或玩笑推断。
-6. 不要把当前平台昵称重复当成新别名；只有历史称呼、群友实际使用的称呼才放入 aliases。
-7. 每个事实必须给出 evidence_line_ids，且只能引用下面真实存在的 L 行；不能伪造行号。
-8. 对旧画像做去重和纠错：没有变化不要重复输出；发生明确变化时使用 replace 或 expire。replace 只在 value 已经包含该字段当前完整状态时使用。
-9. 只输出 JSON，不要解释，不要输出 Markdown 代码块，不要增加未列出的字段。
+6. 不要把当前平台昵称重复当成新别名；只有历史称呼、群友实际使用的称呼才放入 aliases。同一用户可以有多个不同昵称；同一个昵称由多人使用时，分别提供 called_by_user_id，但不要重复写入 relations。
+7. 每个昵称都必须给出实际包含该称呼的 call_line_ids。若依靠上下文判断目标，还必须给出目标本人随后自然回应的 target_response_line_ids；不要把只有第三人称描述、无人回应的称呼直接判定给批次中的某个用户。单纯在同一句中 @ 或引用某人，只能证明消息发给他，不能证明句中的昵称就是他；例如“星老师太吵了 @示例用户”不能据此把“星老师”归给示例用户。只有明确自称，或“以后叫你X / 你就是X”一类直接命名表达，才可作为强归属。attribution_type 只能是 explicit_at、reply、self_declaration、context_response 或 ambiguous。
+8. 每个事实必须给出 evidence_line_ids，且只能引用下面真实存在的 L 行；不能伪造行号。
+9. 具体称呼只写入 aliases；relations 不得使用“称呼”类型。其他关系按“方向相同的用户对 + relation_type”维护唯一的一条综合描述，确有变化时使用 replace，并在 value 中保留仍成立的旧关系信息。
+10. 对旧画像做去重和纠错：没有变化不要重复输出；发生明确变化时使用 replace 或 expire。replace 只在 value 已经包含该字段当前完整状态时使用。
+11. 只输出 JSON，不要解释，不要输出 Markdown 代码块，不要增加未列出的字段。
 
 允许的画像字段：{field_text}
 
@@ -364,10 +366,10 @@ def build_summary_prompt(
     {{"user_id":"12345678","field":"interests","action":"add|replace|expire","value":"简短内容","confidence":0.0,"source":"explicit|repeated|observed","evidence_line_ids":[1]}}
   ],
   "aliases": [
-    {{"target_user_id":"12345678","alias":"阿明","called_by_user_id":"22334455","confidence":0.0,"evidence_line_ids":[2]}}
+    {{"target_user_id":"12345678","alias":"阿明","called_by_user_id":"22334455","attribution_type":"context_response","confidence":0.0,"call_line_ids":[2],"target_response_line_ids":[3]}}
   ],
   "relations": [
-    {{"from_user_id":"12345678","to_user_id":"22334455","relation_type":"称呼|游戏搭档|经常互动|其他","value":"简短描述","confidence":0.0,"evidence_line_ids":[2]}}
+    {{"from_user_id":"12345678","to_user_id":"22334455","relation_type":"游戏搭档|经常互动|其他","action":"replace","value":"完整的综合描述","confidence":0.0,"evidence_line_ids":[2]}}
   ],
   "observations": [
     {{"user_id":"12345678","field":"communication_style","action":"replace","value":"在本群表现为……","confidence":0.0,"evidence_line_ids":[1,3]}}
@@ -438,6 +440,43 @@ def _evidence_lines(item: Mapping[str, Any], by_id: Mapping[int, NumberedMessage
     return tuple(result[:5])
 
 
+def _named_line_ids(
+    item: Mapping[str, Any],
+    key: str,
+    by_id: Mapping[int, NumberedMessage],
+    *,
+    fallback: tuple[int, ...] = (),
+) -> tuple[int, ...]:
+    raw_values = item.get(key, fallback)
+    if not isinstance(raw_values, (list, tuple, set)):
+        raw_values = [raw_values]
+    result: list[int] = []
+    for value in raw_values:
+        try:
+            line_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if line_id in by_id and line_id not in result:
+            result.append(line_id)
+    return tuple(result[:8])
+
+
+def build_alias_target_map(
+    profiles: Mapping[str, Mapping[str, Any]],
+) -> dict[str, set[str]]:
+    """从旧画像构造“规范化昵称 -> 目标用户集合”。"""
+
+    result: dict[str, set[str]] = {}
+    for user_id, profile in profiles.items():
+        for item in profile.get("aliases", []) or []:
+            if item.get("status", "active") != "active":
+                continue
+            canonical = canonical_text(item.get("alias", ""))
+            if canonical:
+                result.setdefault(canonical, set()).add(str(user_id))
+    return result
+
+
 def _evidence_text(line_ids: Iterable[int], by_id: Mapping[int, NumberedMessage]) -> str:
     parts: list[str] = []
     for line_id in line_ids:
@@ -477,6 +516,8 @@ def parse_model_result(
     *,
     min_confidence: float = 0.58,
     max_items: int = 120,
+    existing_alias_targets: Mapping[str, Iterable[str]] | None = None,
+    alias_context_window: int = 4,
 ) -> dict[str, list[dict[str, Any]]]:
     """严格解析并过滤模型结果。
 
@@ -484,7 +525,13 @@ def parse_model_result(
     """
 
     payload = _extract_json(raw)
-    empty = {"facts": [], "aliases": [], "relations": [], "observations": []}
+    empty = {
+        "facts": [],
+        "aliases": [],
+        "alias_candidates": [],
+        "relations": [],
+        "observations": [],
+    }
     if payload is None:
         return empty
 
@@ -501,6 +548,11 @@ def parse_model_result(
         if normalize_user_id(user_id)
     }
     allowed = set(enabled_fields)
+    known_alias_targets = {
+        canonical_text(alias): {str(user_id) for user_id in user_ids}
+        for alias, user_ids in (existing_alias_targets or {}).items()
+        if canonical_text(alias)
+    }
     display_names: dict[str, set[str]] = {}
     for message in numbered:
         if message.sender_name:
@@ -562,6 +614,8 @@ def parse_model_result(
                 )
 
     raw_aliases = payload.get("aliases", [])
+    confirmed_aliases: dict[tuple[str, str], dict[str, Any]] = {}
+    candidate_aliases: dict[tuple[str, str], dict[str, Any]] = {}
     if isinstance(raw_aliases, list) and "aliases" in allowed:
         for item in raw_aliases[:max_items]:
             if not isinstance(item, dict):
@@ -571,6 +625,25 @@ def parse_model_result(
             called_by = normalize_user_id(item.get("called_by_user_id")) or ""
             confidence = _confidence(item.get("confidence"))
             evidence_ids = _evidence_lines(item, by_id)
+            call_line_ids = _named_line_ids(
+                item, "call_line_ids", by_id, fallback=evidence_ids
+            )
+            response_line_ids = _named_line_ids(
+                item, "target_response_line_ids", by_id
+            )
+            canonical_alias = canonical_text(alias)
+            matching_calls = [
+                by_id[line_id]
+                for line_id in call_line_ids
+                if canonical_alias and canonical_alias in canonical_text(by_id[line_id].text)
+            ]
+            if not called_by and matching_calls:
+                speakers = {message.sender_id for message in matching_calls}
+                if len(speakers) == 1:
+                    called_by = next(iter(speakers))
+            caller_calls = [
+                message for message in matching_calls if message.sender_id == called_by
+            ]
             if (
                 not target
                 or target not in known_users
@@ -578,22 +651,97 @@ def parse_model_result(
                 or alias.casefold() in display_names.get(target, set())
                 or confidence is None
                 or confidence < min_confidence
-                or not evidence_ids
+                or not caller_calls
                 or (called_by and called_by not in known_users)
             ):
                 continue
-            result["aliases"].append(
-                {
-                    "target_user_id": target,
-                    "alias": alias,
-                    "called_by_user_id": called_by,
-                    "confidence": confidence,
-                    "evidence_line_ids": evidence_ids,
-                    "evidence": _evidence_text(evidence_ids, by_id),
-                }
+            addressed_target = any(
+                target in message.mentioned_user_ids or message.reply_user_id == target
+                for message in caller_calls
             )
+            self_declaration = any(
+                message.sender_id == target
+                and any(
+                    phrase + canonical_alias in canonical_text(message.text)
+                    for phrase in ("我是", "我叫", "叫我", "喊我", "可以叫我")
+                )
+                for message in caller_calls
+            )
+            explicit_naming = addressed_target and any(
+                any(
+                    pattern in canonical_text(message.text)
+                    for pattern in (
+                        f"以后叫你{canonical_alias}",
+                        f"以后喊你{canonical_alias}",
+                        f"叫你{canonical_alias}",
+                        f"喊你{canonical_alias}",
+                        f"你叫{canonical_alias}",
+                        f"你就是{canonical_alias}",
+                        f"你是{canonical_alias}",
+                    )
+                )
+                for message in caller_calls
+            )
+            context_responses = [
+                by_id[line_id]
+                for line_id in response_line_ids
+                if by_id[line_id].sender_id == target
+                and any(
+                    0 < line_id - call.line_id <= max(1, int(alias_context_window))
+                    for call in caller_calls
+                )
+            ]
+            existing_targets = known_alias_targets.get(canonical_alias, set())
+            existing_unique = existing_targets == {target}
+            parsed_alias = {
+                "target_user_id": target,
+                "alias": alias,
+                "called_by_user_id": called_by,
+                "confidence": confidence,
+                "call_line_ids": tuple(message.line_id for message in caller_calls),
+                "target_response_line_ids": tuple(
+                    message.line_id for message in context_responses
+                ),
+                "evidence_line_ids": tuple(
+                    dict.fromkeys(
+                        [message.line_id for message in caller_calls]
+                        + [message.line_id for message in context_responses]
+                    )
+                ),
+                "evidence": _evidence_text(
+                    [message.line_id for message in caller_calls]
+                    + [message.line_id for message in context_responses],
+                    by_id,
+                ),
+            }
+            if explicit_naming or self_declaration or existing_unique:
+                parsed_alias["attribution_strength"] = (
+                    "strong" if explicit_naming or self_declaration else "existing"
+                )
+                key = (target, canonical_alias)
+                previous = confirmed_aliases.get(key)
+                if previous is None or confidence > float(previous["confidence"]):
+                    confirmed_aliases[key] = parsed_alias
+            else:
+                parsed_alias["attribution_strength"] = (
+                    "anchored"
+                    if addressed_target
+                    else "context"
+                    if context_responses
+                    else "weak"
+                )
+                key = (target, canonical_alias)
+                previous = candidate_aliases.get(key)
+                if previous is None or confidence > float(previous["confidence"]):
+                    candidate_aliases[key] = parsed_alias
+
+    for key in confirmed_aliases:
+        candidate_aliases.pop(key, None)
+    result["aliases"].extend(confirmed_aliases.values())
+    result["alias_candidates"].extend(candidate_aliases.values())
 
     raw_relations = payload.get("relations", [])
+    relations_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
     if isinstance(raw_relations, list) and "relations" in allowed:
         for item in raw_relations[:max_items]:
             if not isinstance(item, dict):
@@ -608,6 +756,7 @@ def parse_model_result(
             values = _values(item)
             confidence = _confidence(item.get("confidence"))
             evidence_ids = _evidence_lines(item, by_id)
+            action = str(item.get("action", "replace") or "replace").strip().lower()
             if (
                 not from_user
                 or not to_user
@@ -615,23 +764,30 @@ def parse_model_result(
                 or to_user not in known_users
                 or from_user == to_user
                 or not relation_type
+                or relation_type == "称呼"
                 or not values
                 or confidence is None
                 or confidence < min_confidence
+                or action != "replace"
                 or not evidence_ids
             ):
                 continue
-            result["relations"].append(
-                {
-                    "from_user_id": from_user,
-                    "to_user_id": to_user,
-                    "relation_type": relation_type,
-                    "value": values[0],
-                    "confidence": confidence,
-                    "evidence_line_ids": evidence_ids,
-                    "evidence": _evidence_text(evidence_ids, by_id),
-                }
-            )
+            parsed_relation = {
+                "from_user_id": from_user,
+                "to_user_id": to_user,
+                "relation_type": relation_type,
+                "action": "replace",
+                "value": values[0],
+                "confidence": confidence,
+                "evidence_line_ids": evidence_ids,
+                "evidence": _evidence_text(evidence_ids, by_id),
+            }
+            key = (from_user, to_user, relation_type)
+            previous = relations_by_key.get(key)
+            if previous is None or confidence > float(previous["confidence"]):
+                relations_by_key[key] = parsed_relation
+
+    result["relations"].extend(relations_by_key.values())
 
     raw_observations = payload.get("observations", [])
     communication_styles: dict[str, dict[str, Any]] = {}
@@ -733,13 +889,18 @@ def render_profile(
         if display_name:
             lines.append(f"当前展示名：{display_name}")
 
-    aliases = [
-        clean_text(item.get("alias", ""), 24)
-        for item in profile.get("aliases", [])
-        if item.get("status", "active") == "active" and item.get("alias")
-    ]
+    aliases: list[str] = []
+    seen_aliases: set[str] = set()
+    for item in profile.get("aliases", []):
+        if item.get("status", "active") != "active" or not item.get("alias"):
+            continue
+        value = clean_text(item.get("alias", ""), 24)
+        canonical = canonical_text(value)
+        if value and canonical not in seen_aliases:
+            seen_aliases.add(canonical)
+            aliases.append(value)
     if aliases:
-        lines.append("已知称呼：" + "、".join(dict.fromkeys(aliases[:8])))
+        lines.append("已知称呼：" + "、".join(aliases[:8]))
 
     facts = [
         item

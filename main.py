@@ -26,7 +26,7 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.event.filter import PermissionType
 from astrbot.api.provider import ProviderRequest
-from astrbot.api.star import Context, Star, StarTools, register
+from astrbot.api.star import Context, Star, StarTools
 
 try:
     from astrbot.core.agent.message import TextPart
@@ -195,7 +195,7 @@ def _mentioned_and_reply(components: Iterable[Any]) -> tuple[tuple[str, ...], st
     mentioned: list[str] = []
     reply_user_id = ""
     for component in components:
-        kind = component.__class__.__name__.casefold()
+        kind = component.__class__.__name__.casefold().strip("_")
         if kind == "at":
             value = (
                 _object_value(component, "qq", "")
@@ -254,12 +254,6 @@ def _make_message_key(
     return "hash:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-@register(
-    PLUGIN_NAME,
-    "Codex",
-    "浮光群像：从群聊中增量勾勒群友的称呼、兴趣、特点与关系",
-    "0.1.0",
-)
 class GlimmerPortraitsPlugin(Star):
     """按群维护轻量画像，并在 LLM 请求前注入相关画像。"""
 
@@ -490,6 +484,10 @@ class GlimmerPortraitsPlugin(Star):
                     min_confidence=_as_float(
                         _config_value(self.config, "min_confidence", 0.58), 0.58, 0.0, 1.0
                     ),
+                    existing_alias_targets=self.store.alias_target_map(scope),
+                    alias_context_window=_as_int(
+                        _config_value(self.config, "alias_context_window", 4), 4, 1, 20
+                    ),
                 )
                 counts = self.store.apply_result_and_consume(
                     scope,
@@ -500,6 +498,18 @@ class GlimmerPortraitsPlugin(Star):
                     ),
                     observation_ttl_days=_as_int(
                         _config_value(self.config, "observation_ttl_days", 90), 90, 0, 3650
+                    ),
+                    alias_candidate_ttl_days=_as_int(
+                        _config_value(self.config, "alias_candidate_ttl_days", 30),
+                        30,
+                        1,
+                        3650,
+                    ),
+                    alias_context_confirmations=_as_int(
+                        _config_value(self.config, "alias_context_confirmations", 2),
+                        2,
+                        2,
+                        20,
                     ),
                     max_facts_per_user=_as_int(
                         _config_value(self.config, "max_facts_per_user", 12), 12, 1, 100
@@ -516,12 +526,13 @@ class GlimmerPortraitsPlugin(Star):
                 )
                 self.store.mark_success(scope)
                 logger.info(
-                    "[GlimmerPortraits] 群画像总结完成 scope=%s reason=%s messages=%s facts=%s aliases=%s relations=%s observations=%s",
+                    "[GlimmerPortraits] 群画像总结完成 scope=%s reason=%s messages=%s facts=%s aliases=%s alias_candidates=%s relations=%s observations=%s",
                     scope,
                     reason,
                     len(pending),
                     counts["facts"],
                     counts["aliases"],
+                    counts["alias_candidates"],
                     counts["relations"],
                     counts["observations"],
                 )

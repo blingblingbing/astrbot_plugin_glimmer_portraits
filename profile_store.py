@@ -123,6 +123,41 @@ class ProfileStore:
             CREATE INDEX IF NOT EXISTS idx_aliases_profile
                 ON aliases(scope, user_id, status);
 
+            CREATE TABLE IF NOT EXISTS alias_callers (
+                scope TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                canonical_alias TEXT NOT NULL,
+                called_by_user_id TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0,
+                occurrences INTEGER NOT NULL DEFAULT 1,
+                first_seen INTEGER NOT NULL DEFAULT 0,
+                last_seen INTEGER NOT NULL DEFAULT 0,
+                evidence TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (scope, user_id, canonical_alias, called_by_user_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_alias_callers_profile
+                ON alias_callers(scope, user_id, canonical_alias);
+
+            CREATE TABLE IF NOT EXISTS alias_candidates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scope TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                alias TEXT NOT NULL,
+                canonical_alias TEXT NOT NULL,
+                callers_json TEXT NOT NULL DEFAULT '[]',
+                confidence REAL NOT NULL DEFAULT 0,
+                context_confirmations INTEGER NOT NULL DEFAULT 0,
+                weak_mentions INTEGER NOT NULL DEFAULT 0,
+                first_seen INTEGER NOT NULL DEFAULT 0,
+                last_seen INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending',
+                evidence TEXT NOT NULL DEFAULT '',
+                expires_at INTEGER NOT NULL DEFAULT 0,
+                UNIQUE (scope, user_id, canonical_alias)
+            );
+            CREATE INDEX IF NOT EXISTS idx_alias_candidates_scope_alias
+                ON alias_candidates(scope, canonical_alias, status);
+
             CREATE TABLE IF NOT EXISTS relations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 scope TEXT NOT NULL,
@@ -180,18 +215,189 @@ class ProfileStore:
                 affected_rows INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS schema_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT ''
+            );
             """
         )
         self.connection.commit()
+        self._migrate_alias_callers()
+        self._collapse_aliases()
+        self._collapse_relations()
         self._collapse_communication_styles()
-        self.connection.execute(
+        self.connection.executescript(
             """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_alias
+            ON aliases(scope, user_id, canonical_alias)
+            WHERE status = 'active';
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_relation_type
+            ON relations(scope, from_user_id, to_user_id, relation_type)
+            WHERE status = 'active';
+
             CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_communication_style
             ON observations(scope, user_id)
-            WHERE field = 'communication_style' AND status = 'active'
+            WHERE field = 'communication_style' AND status = 'active';
             """
         )
         self.connection.commit()
+
+    def _migrate_alias_callers(self) -> int:
+        """一次性把旧昵称行中的称呼者拆分到来源表。"""
+
+        marker = "alias_callers_v1"
+        if self.connection.execute(
+            "SELECT 1 FROM schema_meta WHERE key = ?", (marker,)
+        ).fetchone():
+            return 0
+        rows = self.connection.execute(
+            """
+            SELECT scope, user_id, canonical_alias, called_by_user_id, confidence,
+                   occurrences, first_seen, last_seen, evidence
+            FROM aliases
+            WHERE called_by_user_id <> ''
+            """
+        ).fetchall()
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute("BEGIN")
+            for row in rows:
+                cursor.execute(
+                    """
+                    INSERT INTO alias_callers
+                    (scope, user_id, canonical_alias, called_by_user_id, confidence,
+                     occurrences, first_seen, last_seen, evidence)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(scope, user_id, canonical_alias, called_by_user_id)
+                    DO UPDATE SET
+                      confidence=MAX(alias_callers.confidence, excluded.confidence),
+                      occurrences=alias_callers.occurrences + excluded.occurrences,
+                      first_seen=MIN(alias_callers.first_seen, excluded.first_seen),
+                      last_seen=MAX(alias_callers.last_seen, excluded.last_seen),
+                      evidence=CASE WHEN excluded.last_seen >= alias_callers.last_seen
+                                    THEN excluded.evidence ELSE alias_callers.evidence END
+                    """,
+                    tuple(row),
+                )
+            cursor.execute(
+                "INSERT INTO schema_meta(key, value) VALUES (?, ?)",
+                (marker, str(_now())),
+            )
+            self.connection.commit()
+            return len(rows)
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def _collapse_aliases(self) -> int:
+        """同一用户的同一昵称只保留一条活跃主记录。"""
+
+        rows = self.connection.execute(
+            """
+            SELECT * FROM aliases WHERE status = 'active'
+            ORDER BY scope, user_id, canonical_alias, confidence DESC,
+                     occurrences DESC, last_seen DESC, id DESC
+            """
+        ).fetchall()
+        groups: dict[tuple[str, str, str], list[sqlite3.Row]] = {}
+        for row in rows:
+            key = (str(row["scope"]), str(row["user_id"]), str(row["canonical_alias"]))
+            groups.setdefault(key, []).append(row)
+        cursor = self.connection.cursor()
+        collapsed = 0
+        try:
+            cursor.execute("BEGIN")
+            for group in groups.values():
+                if len(group) < 2:
+                    continue
+                winner = group[0]
+                duplicate_ids = [int(row["id"]) for row in group[1:]]
+                placeholders = ",".join("?" for _ in duplicate_ids)
+                cursor.execute(
+                    f"UPDATE aliases SET status='archived' WHERE id IN ({placeholders})",
+                    duplicate_ids,
+                )
+                cursor.execute(
+                    """
+                    UPDATE aliases
+                    SET confidence = ?, occurrences = ?, first_seen = ?, last_seen = ?,
+                        source = ?, evidence = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        max(float(row["confidence"] or 0) for row in group),
+                        sum(int(row["occurrences"] or 0) for row in group),
+                        min(int(row["first_seen"] or 0) for row in group),
+                        max(int(row["last_seen"] or 0) for row in group),
+                        "platform" if any(row["source"] == "platform" for row in group) else "observed",
+                        str(winner["evidence"] or ""),
+                        int(winner["id"]),
+                    ),
+                )
+                collapsed += len(duplicate_ids)
+            self.connection.commit()
+            return collapsed
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def _collapse_relations(self) -> int:
+        """同方向用户对的同一关系类型只保留一条活跃记录。"""
+
+        rows = self.connection.execute(
+            """
+            SELECT * FROM relations WHERE status = 'active'
+            ORDER BY scope, from_user_id, to_user_id, relation_type,
+                     confidence DESC, occurrences DESC, last_seen DESC, id DESC
+            """
+        ).fetchall()
+        groups: dict[tuple[str, str, str, str], list[sqlite3.Row]] = {}
+        for row in rows:
+            key = (
+                str(row["scope"]),
+                str(row["from_user_id"]),
+                str(row["to_user_id"]),
+                str(row["relation_type"]),
+            )
+            groups.setdefault(key, []).append(row)
+        cursor = self.connection.cursor()
+        collapsed = 0
+        try:
+            cursor.execute("BEGIN")
+            for group in groups.values():
+                if len(group) < 2:
+                    continue
+                winner = group[0]
+                duplicate_ids = [int(row["id"]) for row in group[1:]]
+                placeholders = ",".join("?" for _ in duplicate_ids)
+                cursor.execute(
+                    f"UPDATE relations SET status='archived' WHERE id IN ({placeholders})",
+                    duplicate_ids,
+                )
+                cursor.execute(
+                    """
+                    UPDATE relations
+                    SET confidence = ?, occurrences = ?, first_seen = ?, last_seen = ?,
+                        expires_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        max(float(row["confidence"] or 0) for row in group),
+                        sum(int(row["occurrences"] or 0) for row in group),
+                        min(int(row["first_seen"] or 0) for row in group),
+                        max(int(row["last_seen"] or 0) for row in group),
+                        max(int(row["expires_at"] or 0) for row in group),
+                        int(winner["id"]),
+                    ),
+                )
+                collapsed += len(duplicate_ids)
+            self.connection.commit()
+            return collapsed
+        except Exception:
+            self.connection.rollback()
+            raise
 
     def _collapse_communication_styles(self) -> int:
         """将旧版本累积的沟通风格收敛为每位用户一条活跃记录。"""
@@ -450,8 +656,22 @@ class ProfileStore:
             "AND status = 'active' ORDER BY confidence DESC, occurrences DESC, last_seen DESC",
             base_params,
         ).fetchall()
+        alias_by_key: dict[tuple[str, str], dict[str, Any]] = {}
         for row in alias_rows:
-            result[str(row["user_id"])]["aliases"].append(dict(row))
+            data = dict(row)
+            data["called_by_user_ids"] = []
+            result[str(row["user_id"])]["aliases"].append(data)
+            alias_by_key[(str(row["user_id"]), str(row["canonical_alias"]))] = data
+
+        caller_rows = self.connection.execute(
+            f"SELECT * FROM alias_callers WHERE scope = ? AND user_id IN ({placeholders}) "
+            "ORDER BY occurrences DESC, confidence DESC, last_seen DESC",
+            base_params,
+        ).fetchall()
+        for row in caller_rows:
+            alias = alias_by_key.get((str(row["user_id"]), str(row["canonical_alias"])))
+            if alias is not None:
+                alias["called_by_user_ids"].append(str(row["called_by_user_id"]))
 
         observation_rows = self.connection.execute(
             f"SELECT * FROM observations WHERE scope = ? AND user_id IN ({placeholders}) "
@@ -582,6 +802,21 @@ class ProfileStore:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def alias_target_map(self, scope: str) -> dict[str, set[str]]:
+        rows = self.connection.execute(
+            """
+            SELECT canonical_alias, user_id FROM aliases
+            WHERE scope = ? AND status = 'active'
+            """,
+            (scope,),
+        ).fetchall()
+        result: dict[str, set[str]] = {}
+        for row in rows:
+            result.setdefault(str(row["canonical_alias"]), set()).add(
+                str(row["user_id"])
+            )
+        return result
+
     def apply_result_and_consume(
         self,
         scope: str,
@@ -590,6 +825,8 @@ class ProfileStore:
         *,
         temporary_ttl_days: int = 45,
         observation_ttl_days: int = 90,
+        alias_candidate_ttl_days: int = 30,
+        alias_context_confirmations: int = 2,
         max_facts_per_user: int = 12,
         max_aliases_per_user: int = 8,
         max_observations_per_user: int = 5,
@@ -599,7 +836,13 @@ class ProfileStore:
 
         now = _now()
         cursor = self.connection.cursor()
-        counts = {"facts": 0, "aliases": 0, "relations": 0, "observations": 0}
+        counts = {
+            "facts": 0,
+            "aliases": 0,
+            "alias_candidates": 0,
+            "relations": 0,
+            "observations": 0,
+        }
         try:
             cursor.execute("BEGIN")
             for item in result.get("facts", []) or []:
@@ -614,6 +857,18 @@ class ProfileStore:
             for item in result.get("aliases", []) or []:
                 self._apply_alias_cursor(cursor, scope, item, now)
                 counts["aliases"] += 1
+            for item in result.get("alias_candidates", []) or []:
+                promoted = self._apply_alias_candidate_cursor(
+                    cursor,
+                    scope,
+                    item,
+                    now,
+                    ttl_days=max(1, int(alias_candidate_ttl_days)),
+                    required_confirmations=max(2, int(alias_context_confirmations)),
+                )
+                counts["alias_candidates"] += 1
+                if promoted:
+                    counts["aliases"] += 1
             for item in result.get("relations", []) or []:
                 self._apply_relation_cursor(
                     cursor,
@@ -656,7 +911,8 @@ class ProfileStore:
             }
             affected_users.update(
                 str(item.get("target_user_id", ""))
-                for item in result.get("aliases", []) or []
+                for key in ("aliases", "alias_candidates")
+                for item in result.get(key, []) or []
                 if str(item.get("target_user_id", ""))
             )
             affected_users.update(
@@ -691,6 +947,8 @@ class ProfileStore:
             ("profiles", "user_id"),
             ("facts", "user_id"),
             ("aliases", "user_id"),
+            ("alias_callers", "user_id"),
+            ("alias_candidates", "user_id"),
             ("observations", "user_id"),
         ):
             query = f"SELECT COUNT(*) FROM {table} WHERE {clauses}"
@@ -750,6 +1008,8 @@ class ProfileStore:
             if user_id:
                 cursor.execute("DELETE FROM facts WHERE scope = ? AND user_id = ?", (scope, user_id))
                 cursor.execute("DELETE FROM aliases WHERE scope = ? AND user_id = ?", (scope, user_id))
+                cursor.execute("DELETE FROM alias_callers WHERE scope = ? AND user_id = ?", (scope, user_id))
+                cursor.execute("DELETE FROM alias_candidates WHERE scope = ? AND user_id = ?", (scope, user_id))
                 cursor.execute("DELETE FROM observations WHERE scope = ? AND user_id = ?", (scope, user_id))
                 cursor.execute(
                     "DELETE FROM relations WHERE scope = ? AND (from_user_id = ? OR to_user_id = ?)",
@@ -778,7 +1038,16 @@ class ProfileStore:
                     )
                 affected = sum(counts.values())
             else:
-                for table in ("facts", "aliases", "relations", "observations", "profiles", "pending_messages"):
+                for table in (
+                    "facts",
+                    "aliases",
+                    "alias_callers",
+                    "alias_candidates",
+                    "relations",
+                    "observations",
+                    "profiles",
+                    "pending_messages",
+                ):
                     cursor.execute(f"DELETE FROM {table} WHERE scope = ?", (scope,))
                 affected = sum(counts.values())
             cursor.execute(
@@ -809,6 +1078,14 @@ class ProfileStore:
             )
             self.connection.execute(
                 "UPDATE relations SET status='expired' WHERE status='active' AND expires_at > 0 AND expires_at <= ?",
+                (now,),
+            )
+            self.connection.execute(
+                """
+                UPDATE alias_candidates SET status='expired'
+                WHERE status IN ('pending', 'conflict')
+                  AND expires_at > 0 AND expires_at <= ?
+                """,
                 (now,),
             )
             self.connection.commit()
@@ -845,12 +1122,65 @@ class ProfileStore:
         if not alias:
             return
         canonical = canonical_text(alias)
+        if called_by_user_id:
+            cursor.execute(
+                """
+                INSERT INTO alias_callers
+                (scope, user_id, canonical_alias, called_by_user_id, confidence,
+                 occurrences, first_seen, last_seen, evidence)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+                ON CONFLICT(scope, user_id, canonical_alias, called_by_user_id)
+                DO UPDATE SET
+                  confidence=MAX(alias_callers.confidence, excluded.confidence),
+                  occurrences=alias_callers.occurrences + 1,
+                  last_seen=excluded.last_seen, evidence=excluded.evidence
+                """,
+                (
+                    scope,
+                    user_id,
+                    canonical,
+                    called_by_user_id,
+                    confidence,
+                    now,
+                    now,
+                    clean_text(evidence, 360),
+                ),
+            )
+        active = cursor.execute(
+            """
+            SELECT id FROM aliases
+            WHERE scope = ? AND user_id = ? AND canonical_alias = ? AND status = 'active'
+            LIMIT 1
+            """,
+            (scope, user_id, canonical),
+        ).fetchone()
+        if active:
+            cursor.execute(
+                """
+                UPDATE aliases
+                SET alias = ?,
+                    source = CASE WHEN source='platform' OR ?='platform'
+                                  THEN 'platform' ELSE 'observed' END,
+                    confidence = MAX(confidence, ?), occurrences = occurrences + 1,
+                    last_seen = ?, evidence = ?, status = 'active'
+                WHERE id = ?
+                """,
+                (
+                    alias,
+                    source,
+                    confidence,
+                    now,
+                    clean_text(evidence, 360),
+                    int(active["id"]),
+                ),
+            )
+            return
         cursor.execute(
             """
             INSERT INTO aliases
             (scope, user_id, alias, canonical_alias, source, called_by_user_id, confidence,
              occurrences, first_seen, last_seen, status, evidence)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'active', ?)
+            VALUES (?, ?, ?, ?, ?, '', ?, 1, ?, ?, 'active', ?)
             ON CONFLICT(scope, user_id, canonical_alias, called_by_user_id) DO UPDATE SET
               alias=excluded.alias, source=excluded.source,
               confidence=MAX(aliases.confidence, excluded.confidence),
@@ -863,7 +1193,6 @@ class ProfileStore:
                 alias,
                 canonical,
                 source,
-                called_by_user_id,
                 confidence,
                 now,
                 now,
@@ -964,6 +1293,151 @@ class ProfileStore:
             evidence=str(item.get("evidence", "") or ""),
             now=now,
         )
+        canonical = canonical_text(alias)
+        cursor.execute(
+            """
+            UPDATE alias_candidates
+            SET status = CASE WHEN user_id = ? THEN 'promoted' ELSE 'conflict' END
+            WHERE scope = ? AND canonical_alias = ?
+              AND status IN ('pending', 'conflict')
+            """,
+            (target, scope, canonical),
+        )
+
+    def _apply_alias_candidate_cursor(
+        self,
+        cursor: sqlite3.Cursor,
+        scope: str,
+        item: Mapping[str, Any],
+        now: int,
+        *,
+        ttl_days: int,
+        required_confirmations: int,
+    ) -> bool:
+        target = clean_text(item.get("target_user_id", ""), 128)
+        alias = normalize_alias(item.get("alias", ""))
+        called_by = clean_text(item.get("called_by_user_id", ""), 128)
+        strength = clean_text(item.get("attribution_strength", "weak"), 20)
+        if not target or not alias or strength not in {"anchored", "context", "weak"}:
+            return False
+        canonical = canonical_text(alias)
+        existing = cursor.execute(
+            """
+            SELECT callers_json FROM alias_candidates
+            WHERE scope = ? AND user_id = ? AND canonical_alias = ?
+            """,
+            (scope, target, canonical),
+        ).fetchone()
+        callers = _load_json(existing["callers_json"], []) if existing else []
+        if not isinstance(callers, list):
+            callers = []
+        callers = [str(value) for value in callers if str(value)]
+        if called_by and called_by not in callers:
+            callers.append(called_by)
+        context_increment = 1 if strength in {"anchored", "context"} else 0
+        weak_increment = 1 if strength == "weak" else 0
+        cursor.execute(
+            """
+            INSERT INTO alias_candidates
+            (scope, user_id, alias, canonical_alias, callers_json, confidence,
+             context_confirmations, weak_mentions, first_seen, last_seen,
+             status, evidence, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+            ON CONFLICT(scope, user_id, canonical_alias) DO UPDATE SET
+              alias=excluded.alias, callers_json=excluded.callers_json,
+              confidence=MAX(alias_candidates.confidence, excluded.confidence),
+              context_confirmations=alias_candidates.context_confirmations + excluded.context_confirmations,
+              weak_mentions=alias_candidates.weak_mentions + excluded.weak_mentions,
+              last_seen=excluded.last_seen, status='pending', evidence=excluded.evidence,
+              expires_at=excluded.expires_at
+            """,
+            (
+                scope,
+                target,
+                alias,
+                canonical,
+                _json(callers),
+                float(item.get("confidence", 0) or 0),
+                context_increment,
+                weak_increment,
+                now,
+                now,
+                clean_text(item.get("evidence", ""), 360),
+                now + ttl_days * 86400,
+            ),
+        )
+        formal_targets = {
+            str(row["user_id"])
+            for row in cursor.execute(
+                """
+                SELECT user_id FROM aliases
+                WHERE scope = ? AND canonical_alias = ? AND status = 'active'
+                """,
+                (scope, canonical),
+            ).fetchall()
+        }
+        candidate_rows = cursor.execute(
+            """
+            SELECT * FROM alias_candidates
+            WHERE scope = ? AND canonical_alias = ?
+              AND status IN ('pending', 'conflict')
+            ORDER BY context_confirmations DESC, confidence DESC, last_seen DESC
+            """,
+            (scope, canonical),
+        ).fetchall()
+        contextual_targets = {
+            str(row["user_id"])
+            for row in candidate_rows
+            if int(row["context_confirmations"] or 0) > 0
+        }
+        eligible = [
+            row
+            for row in candidate_rows
+            if int(row["context_confirmations"] or 0) >= required_confirmations
+        ]
+        conflict = len(contextual_targets) > 1 or bool(
+            formal_targets and formal_targets != {target}
+        )
+        if conflict:
+            cursor.execute(
+                """
+                UPDATE alias_candidates SET status='conflict'
+                WHERE scope = ? AND canonical_alias = ?
+                  AND status IN ('pending', 'conflict')
+                """,
+                (scope, canonical),
+            )
+            return False
+        if len(eligible) != 1:
+            return False
+        winner = eligible[0]
+        winner_callers = _load_json(winner["callers_json"], [])
+        if not isinstance(winner_callers, list):
+            winner_callers = []
+        if not winner_callers:
+            winner_callers = [called_by] if called_by else []
+        for caller in dict.fromkeys(str(value) for value in winner_callers if str(value)):
+            self._upsert_alias_cursor(
+                cursor,
+                scope=scope,
+                user_id=str(winner["user_id"]),
+                alias=str(winner["alias"]),
+                source="observed",
+                called_by_user_id=caller,
+                confidence=float(winner["confidence"] or 0),
+                evidence=str(winner["evidence"] or ""),
+                now=now,
+            )
+        cursor.execute(
+            """
+            UPDATE alias_candidates
+            SET status = CASE WHEN user_id = ? THEN 'promoted' ELSE 'conflict' END
+            WHERE scope = ? AND canonical_alias = ?
+              AND status IN ('pending', 'conflict')
+            """,
+            (str(winner["user_id"]), scope, canonical),
+        )
+        return True
 
     def _apply_relation_cursor(
         self,
@@ -982,6 +1456,14 @@ class ProfileStore:
             return
         canonical = canonical_text(value)
         expires_at = now + temporary_ttl_days * 86400 if temporary_ttl_days else 0
+        cursor.execute(
+            """
+            UPDATE relations SET status='archived'
+            WHERE scope = ? AND from_user_id = ? AND to_user_id = ?
+              AND relation_type = ? AND status = 'active'
+            """,
+            (scope, from_user, to_user, relation_type),
+        )
         cursor.execute(
             """
             INSERT INTO relations

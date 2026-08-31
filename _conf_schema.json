@@ -114,6 +114,30 @@
     "max": 1.0,
     "hint": "低于该值的模型结果不会写入数据库。"
   },
+  "alias_context_window": {
+    "description": "昵称上下文回应窗口（消息数）",
+    "type": "int",
+    "default": 4,
+    "min": 1,
+    "max": 20,
+    "hint": "没有 @ 或引用时，目标用户需在称呼后的该消息数内自然回应，才算一次上下文确认。"
+  },
+  "alias_context_confirmations": {
+    "description": "候选昵称晋升所需确认次数",
+    "type": "int",
+    "default": 2,
+    "min": 2,
+    "max": 20,
+    "hint": "上下文归因累计达到该次数后，候选昵称才会进入正式画像。"
+  },
+  "alias_candidate_ttl_days": {
+    "description": "候选昵称保留时间（天）",
+    "type": "int",
+    "default": 30,
+    "min": 1,
+    "max": 3650,
+    "hint": "长期没有新证据的候选或冲突昵称会自动过期。"
+  },
   "temporary_ttl_days": {
     "description": "临时画像保留时间（天）",
     "type": "int",
@@ -138,11 +162,12 @@
     "max": 100
   },
   "max_aliases_per_user": {
-    "description": "每用户最多保留称呼数",
+    "description": "每用户最多保留不同称呼数",
     "type": "int",
     "default": 8,
     "min": 1,
-    "max": 100
+    "max": 100,
+    "hint": "同一称呼由多人使用时只占一个名额，称呼者来源会分别保留。"
   },
   "max_observations_per_user": {
     "description": "每用户最多保留其他群内观察数",
@@ -157,7 +182,8 @@
     "type": "int",
     "default": 12,
     "min": 1,
-    "max": 100
+    "max": 100,
+    "hint": "同方向用户对的同一关系类型只保留一条综合描述。"
   },
   "profile_active_days": {
     "description": "活跃画像时间范围（天）",

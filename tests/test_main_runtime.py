@@ -239,9 +239,9 @@ class MainRuntimeTests(unittest.TestCase):
         second = _Event(
             "22334455",
             "小红",
-            "明哥又带你打本？",
+            "以后叫你明哥",
             message_id="m2",
-            components=[_Plain("明哥又带你打本？"), _Reply("12345678")],
+            components=[_Plain("以后叫你明哥"), _Reply("12345678")],
         )
         asyncio.run(self.plugin.capture_group_message(first))
         asyncio.run(self.plugin.capture_group_message(second))

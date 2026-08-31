@@ -2,7 +2,7 @@ name: astrbot_plugin_glimmer_portraits
 display_name: 浮光群像
 desc: "从群聊的浮光片语中，增量勾勒群友的称呼、兴趣、特点与关系"
 help: "管理员指令：/群画像、/更新画像、/重置画像"
-version: v0.1.0
+version: 0.1.0
 author: blingblingbing
 repo: https://github.com/blingblingbing/astrbot_plugin_glimmer_portraits
-astrbot_version: ">=4.0.0"
+astrbot_version: ">=4.24.0"
