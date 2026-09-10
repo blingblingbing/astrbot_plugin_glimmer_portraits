@@ -614,6 +614,10 @@ class GlimmerPortraitsPlugin(Star):
         per_user_chars = _as_int(
             _config_value(self.config, "injection_max_chars_per_user", 500), 500, 120, 3000
         )
+        total_limit = _as_int(
+            _config_value(self.config, "injection_max_total_chars", 1400), 1400, 200, 12000
+        )
+        used_chars = 0
         for user_id in user_ids[:max_users]:
             profile = profiles.get(user_id)
             if not profile:
@@ -624,17 +628,22 @@ class GlimmerPortraitsPlugin(Star):
                 for key in ("facts", "observations", "relations", "aliases")
             ):
                 continue
-            rendered.append(
-                render_profile(profile, max_chars=per_user_chars, injection=True)
+            separator_chars = 1 if rendered else 0
+            remaining_chars = total_limit - used_chars - separator_chars
+            if remaining_chars <= 0:
+                break
+            rendered_profile = render_profile(
+                profile,
+                max_chars=min(per_user_chars, remaining_chars),
+                injection=True,
             )
+            if not rendered_profile or len(rendered_profile) > remaining_chars:
+                continue
+            rendered.append(rendered_profile)
+            used_chars += separator_chars + len(rendered_profile)
         if not rendered:
             return
-        total_limit = _as_int(
-            _config_value(self.config, "injection_max_total_chars", 1400), 1400, 200, 12000
-        )
         text = "\n".join(rendered)
-        if len(text) > total_limit:
-            text = text[: max(0, total_limit - 1)].rstrip() + "…"
         part = _make_temp_text_part(text)
         parts = getattr(req, "extra_user_content_parts", None)
         if isinstance(parts, list):

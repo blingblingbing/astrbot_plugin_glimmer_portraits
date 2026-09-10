@@ -273,6 +273,8 @@ class MainRuntimeTests(unittest.TestCase):
         injected = request.extra_user_content_parts[0]
         self.assertIn("原神", injected.text)
         self.assertTrue(getattr(injected, "is_temp", False))
+        self.assertTrue(injected.text.endswith("</group_profile>"))
+        self.assertLessEqual(len(injected.text), 1400)
 
         async def collect(generator):
             return [item async for item in generator]

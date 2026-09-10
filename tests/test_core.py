@@ -72,6 +72,12 @@ class ProfileEngineTests(unittest.TestCase):
         self.assertIn("摄影", prompt)
         self.assertIn("不要按某个用户单独截取", prompt)
 
+    def test_summary_prompt_requires_compact_values(self) -> None:
+        prompt = build_summary_prompt(self.messages, {}, ["interests"])
+        self.assertIn("每个 value 只写一条短结论或短语", prompt)
+        self.assertIn("硬上限 40 个字符", prompt)
+        self.assertIn("不要复述证据", prompt)
+
     def test_parser_rejects_unknown_user_and_unknown_evidence(self) -> None:
         raw = """
         {
@@ -458,6 +464,59 @@ class ProfileStoreTests(unittest.TestCase):
         self.assertLessEqual(len(text), 500)
         self.assertIn("摄影", text)
         self.assertIn("明哥", text)
+
+    def test_injection_renderer_compacts_long_values_and_preserves_wrapper(self) -> None:
+        text = render_profile(
+            {
+                "user_id": "3110322077",
+                "aliases": [
+                    {"alias": "217姐姐", "source": "observed", "status": "active"},
+                    {"alias": "老登", "source": "observed", "status": "active"},
+                ],
+                "facts": [
+                    {
+                        "field": "recent_context",
+                        "value": "近期学业与实验安排紧凑，过去一周每日睡眠不足7小时，自述曾在西藏期间均摊至不到6小时，态度乐观表示‘死不了’。",
+                        "confidence": 0.95,
+                        "status": "active",
+                        "last_seen": 1700000000,
+                    },
+                    {
+                        "field": "occupation_or_study",
+                        "value": "本科就读于物理相关专业，目前处于论文开题及写作准备阶段。",
+                        "confidence": 0.9,
+                        "status": "active",
+                        "last_seen": 1700000000,
+                    },
+                    {
+                        "field": "coarse_location",
+                        "value": "生活/活动于北京地区（自述经历晚高峰通勤）",
+                        "confidence": 0.85,
+                        "status": "active",
+                        "last_seen": 1700000000,
+                    },
+                ],
+                "observations": [
+                    {
+                        "field": "communication_style",
+                        "value": "在本群表现为交流直率且信息密度较高，日常以简短玩闹或反问接话。",
+                        "confidence": 0.9,
+                        "status": "active",
+                        "last_seen": 1700000000,
+                    }
+                ],
+                "relations": [],
+            },
+            max_chars=500,
+            injection=True,
+        )
+        self.assertLessEqual(len(text), 500)
+        self.assertTrue(text.startswith("<group_profile>"))
+        self.assertTrue(text.endswith("</group_profile>"))
+        self.assertIn("睡眠不足", text)
+        self.assertIn("沟通：", text)
+        self.assertNotIn("高置信度", text)
+        self.assertTrue(all(len(line) <= 72 for line in text.splitlines()))
 
     def test_communication_style_replaces_previous_active_style(self) -> None:
         values = ("在本群表现为回复简洁", "在本群表现为回复简洁且善于接梗")
