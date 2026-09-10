@@ -77,6 +77,7 @@ class ProfileEngineTests(unittest.TestCase):
         self.assertIn("每个 value 只写一条短结论或短语", prompt)
         self.assertIn("硬上限 40 个字符", prompt)
         self.assertIn("不要复述证据", prompt)
+        self.assertIn("alias_activity", prompt)
 
     def test_parser_rejects_unknown_user_and_unknown_evidence(self) -> None:
         raw = """
@@ -329,6 +330,26 @@ class ProfileEngineTests(unittest.TestCase):
         )
         self.assertEqual(len(result["aliases"]), 1)
         self.assertEqual(result["aliases"][0]["attribution_strength"], "existing")
+
+    def test_alias_activity_refreshes_only_unique_existing_alias(self) -> None:
+        raw = """
+        {
+          "alias_activity": [
+            {"target_user_id":"12345678","alias":"明哥","called_by_user_id":"22334455","evidence_line_ids":[2]},
+            {"target_user_id":"12345678","alias":"不存在","called_by_user_id":"22334455","evidence_line_ids":[2]}
+          ]
+        }
+        """
+        result = parse_model_result(
+            raw,
+            self.messages,
+            ["aliases"],
+            min_confidence=0.5,
+            existing_alias_targets={"明哥": {"12345678"}},
+        )
+        self.assertEqual(len(result["alias_activity"]), 1)
+        self.assertEqual(result["alias_activity"][0]["target_user_id"], "12345678")
+        self.assertEqual(result["alias_activity"][0]["called_by_user_id"], "22334455")
 
 
 class ProfileStoreTests(unittest.TestCase):
@@ -807,6 +828,173 @@ class ProfileStoreTests(unittest.TestCase):
             "SELECT status FROM alias_candidates WHERE user_id='33445566'"
         ).fetchone()[0]
         self.assertEqual(status, "conflict")
+
+    def test_observed_alias_expires_but_explicit_alias_does_not(self) -> None:
+        self.store.add_message(
+            scope="qq:100",
+            platform="qq",
+            group_id="100",
+            message_key="expiry-profile",
+            sender_id="12345678",
+            sender_name="当前昵称",
+            text="测试消息",
+        )
+        self.store.apply_result_and_consume(
+            "qq:100",
+            [],
+            {
+                "facts": [],
+                "aliases": [
+                    {
+                        "target_user_id": "12345678",
+                        "alias": "旧称呼",
+                        "called_by_user_id": "22334455",
+                        "confidence": 0.9,
+                    },
+                    {
+                        "target_user_id": "12345678",
+                        "alias": "自称称呼",
+                        "called_by_user_id": "12345678",
+                        "attribution_type": "self_declaration",
+                        "confidence": 0.9,
+                    },
+                ],
+                "alias_candidates": [],
+                "alias_activity": [],
+                "relations": [],
+                "observations": [],
+            },
+        )
+        old_seen = int(time.time()) - 31 * 86400
+        self.store.connection.execute(
+            "UPDATE aliases SET last_seen=? WHERE canonical_alias IN ('旧称呼','自称称呼')",
+            (old_seen,),
+        )
+        self.store.connection.commit()
+        self.store.observed_alias_ttl_days = 30
+
+        profile = self.store.get_profile("qq:100", "12345678")
+        self.assertIsNotNone(profile)
+        assert profile is not None
+        active_aliases = {item["alias"] for item in profile["aliases"]}
+        self.assertNotIn("旧称呼", active_aliases)
+        self.assertIn("自称称呼", active_aliases)
+        statuses = self.store.connection.execute(
+            "SELECT alias,status FROM aliases WHERE canonical_alias IN ('旧称呼','自称称呼')"
+        ).fetchall()
+        self.assertEqual(
+            {row["alias"]: row["status"] for row in statuses},
+            {"旧称呼": "expired", "自称称呼": "active"},
+        )
+
+    def test_alias_activity_updates_last_seen(self) -> None:
+        self.store.add_message(
+            scope="qq:100",
+            platform="qq",
+            group_id="100",
+            message_key="activity-profile",
+            sender_id="12345678",
+            sender_name="当前昵称",
+            text="测试消息",
+        )
+        self.store.apply_result_and_consume(
+            "qq:100",
+            [],
+            {
+                "facts": [],
+                "aliases": [
+                    {
+                        "target_user_id": "12345678",
+                        "alias": "明哥",
+                        "called_by_user_id": "22334455",
+                        "confidence": 0.9,
+                    }
+                ],
+                "alias_candidates": [],
+                "alias_activity": [],
+                "relations": [],
+                "observations": [],
+            },
+        )
+        old_seen = int(time.time()) - 100
+        self.store.connection.execute(
+            "UPDATE aliases SET last_seen=? WHERE canonical_alias='明哥'", (old_seen,)
+        )
+        self.store.connection.commit()
+        counts = self.store.apply_result_and_consume(
+            "qq:100",
+            [],
+            {
+                "facts": [],
+                "aliases": [],
+                "alias_candidates": [],
+                "alias_activity": [
+                    {
+                        "target_user_id": "12345678",
+                        "alias": "明哥",
+                        "called_by_user_id": "22334455",
+                        "evidence": "L2 称呼者：明哥今天来吗",
+                    }
+                ],
+                "relations": [],
+                "observations": [],
+            },
+        )
+        self.assertEqual(counts["alias_activity"], 1)
+        row = self.store.connection.execute(
+            "SELECT last_seen,occurrences FROM aliases WHERE canonical_alias='明哥'"
+        ).fetchone()
+        self.assertGreaterEqual(row["last_seen"], int(time.time()) - 5)
+        self.assertEqual(row["occurrences"], 2)
+
+    def test_archive_alias_keeps_history_and_blocks_old_candidate(self) -> None:
+        self.store.add_message(
+            scope="qq:100",
+            platform="qq",
+            group_id="100",
+            message_key="archive-profile",
+            sender_id="12345678",
+            sender_name="当前昵称",
+            text="测试消息",
+        )
+        self.store.apply_result_and_consume(
+            "qq:100",
+            [],
+            {
+                "facts": [],
+                "aliases": [
+                    {
+                        "target_user_id": "12345678",
+                        "alias": "明哥",
+                        "called_by_user_id": "22334455",
+                        "confidence": 0.9,
+                    }
+                ],
+                "alias_candidates": [
+                    {
+                        "target_user_id": "12345678",
+                        "alias": "明哥",
+                        "called_by_user_id": "22334455",
+                        "attribution_strength": "context",
+                        "confidence": 0.9,
+                    }
+                ],
+                "alias_activity": [],
+                "relations": [],
+                "observations": [],
+            },
+        )
+        counts = self.store.archive_alias("qq:100", "12345678", "明哥")
+        self.assertEqual(counts["aliases"], 1)
+        self.assertEqual(counts["alias_candidates"], 1)
+        row = self.store.connection.execute(
+            "SELECT status FROM aliases WHERE canonical_alias='明哥'"
+        ).fetchone()
+        self.assertEqual(row["status"], "archived")
+        candidate = self.store.connection.execute(
+            "SELECT status FROM alias_candidates WHERE canonical_alias='明哥'"
+        ).fetchone()
+        self.assertEqual(candidate["status"], "archived")
 
 
 if __name__ == "__main__":

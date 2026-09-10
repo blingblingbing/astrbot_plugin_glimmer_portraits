@@ -133,10 +133,18 @@
   "alias_candidate_ttl_days": {
     "description": "候选昵称保留时间（天）",
     "type": "int",
-    "default": 30,
+    "default": 14,
     "min": 1,
     "max": 3650,
-    "hint": "长期没有新证据的候选或冲突昵称会自动过期。"
+    "hint": "长期没有新证据的候选或冲突昵称会自动过期；默认保留14天。"
+  },
+  "observed_alias_ttl_days": {
+    "description": "观察到的正式昵称保留时间（天）",
+    "type": "int",
+    "default": 30,
+    "min": 0,
+    "max": 3650,
+    "hint": "source=observed 的昵称超过该时间没有新的实际使用记录会自动过期；0 表示不过期。明确自称或直接命名的昵称不受此项影响。"
   },
   "temporary_ttl_days": {
     "description": "临时画像保留时间（天）",

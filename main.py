@@ -48,7 +48,7 @@ from .profile_store import ProfileStore
 
 
 PLUGIN_NAME = "astrbot_plugin_glimmer_portraits"
-COMMAND_NAMES = ("群画像", "更新画像", "重置画像")
+COMMAND_NAMES = ("群画像", "更新画像", "重置画像", "删除称呼")
 QQ_ID_RE = re.compile(r"^[0-9]{5,20}$")
 MEDIA_PLACEHOLDER_RE = re.compile(
     r"\[(?:图片(?:内容)?|图像|image|动画表情|表情包?|贴纸|sticker|face|视频|video|语音|voice|音频|audio|文件|file)(?:\s*[:：,，][^\]]*)?\]",
@@ -262,7 +262,15 @@ class GlimmerPortraitsPlugin(Star):
         self.context = context
         self.config = config
         data_dir = Path(StarTools.get_data_dir(PLUGIN_NAME))
-        self.store = ProfileStore(data_dir / "group_profiles.sqlite3")
+        self.store = ProfileStore(
+            data_dir / "group_profiles.sqlite3",
+            observed_alias_ttl_days=_as_int(
+                _config_value(self.config, "observed_alias_ttl_days", 30),
+                30,
+                0,
+                3650,
+            ),
+        )
         self._update_tasks: dict[str, asyncio.Task[Any]] = {}
         self._group_locks: dict[str, asyncio.Lock] = {}
         self._scheduler_task: asyncio.Task[Any] | None = None
@@ -500,8 +508,8 @@ class GlimmerPortraitsPlugin(Star):
                         _config_value(self.config, "observation_ttl_days", 90), 90, 0, 3650
                     ),
                     alias_candidate_ttl_days=_as_int(
-                        _config_value(self.config, "alias_candidate_ttl_days", 30),
-                        30,
+                        _config_value(self.config, "alias_candidate_ttl_days", 14),
+                        14,
                         1,
                         3650,
                     ),
@@ -526,13 +534,14 @@ class GlimmerPortraitsPlugin(Star):
                 )
                 self.store.mark_success(scope)
                 logger.info(
-                    "[GlimmerPortraits] 群画像总结完成 scope=%s reason=%s messages=%s facts=%s aliases=%s alias_candidates=%s relations=%s observations=%s",
+                    "[GlimmerPortraits] 群画像总结完成 scope=%s reason=%s messages=%s facts=%s aliases=%s alias_candidates=%s alias_activity=%s relations=%s observations=%s",
                     scope,
                     reason,
                     len(pending),
                     counts["facts"],
                     counts["aliases"],
                     counts["alias_candidates"],
+                    counts["alias_activity"],
                     counts["relations"],
                     counts["observations"],
                 )
@@ -747,6 +756,35 @@ class GlimmerPortraitsPlugin(Star):
             yield event.plain_result(
                 f"✅ 已排队更新当前群画像，待处理消息：{pending}。完成后会写入 SQLite。"
             )
+
+    @filter.permission_type(PermissionType.ADMIN)
+    @filter.command("删除称呼")
+    async def command_delete_alias(self, event: AstrMessageEvent, args: str = ""):
+        """归档当前群中指定用户的一条称呼及其未晋升候选。"""
+
+        scoped = self._scope(event)
+        if scoped is None:
+            yield event.plain_result("❌ 请在群聊中使用此指令。")
+            return
+        _, group_id, scope = scoped
+        if not self._group_allowed(group_id):
+            yield event.plain_result("❌ 此群未启用群画像。")
+            return
+        tail = self._command_tail(event, "删除称呼", args)
+        parts = tail.split(maxsplit=1)
+        if len(parts) != 2 or not QQ_ID_RE.fullmatch(parts[0]) or not parts[1].strip():
+            yield event.plain_result("用法：/删除称呼 <QQ号> <昵称>")
+            return
+        target, alias = parts[0], parts[1].strip()
+        lock = self._group_locks.setdefault(scope, asyncio.Lock())
+        async with lock:
+            counts = self.store.archive_alias(scope, target, alias)
+        if not counts["aliases"] and not counts["alias_candidates"]:
+            yield event.plain_result(f"当前群未找到用户 {target} 的称呼「{clean_text(alias, 40)}」。")
+            return
+        yield event.plain_result(
+            f"✅ 已移除用户 {target} 的称呼「{clean_text(alias, 40)}」。"
+        )
 
     def _reset_confirmation_key(self, scope: str, event: Any, target: str) -> tuple[str, str, str]:
         return scope, self._admin_id(event), target

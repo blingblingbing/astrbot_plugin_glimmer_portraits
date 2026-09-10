@@ -425,14 +425,16 @@ def build_summary_prompt(
 4. 沟通风格是每位用户唯一的一条长期综合画像，不是本批聊天摘要。仅当本批至少两条消息共同提供稳定证据，且相较旧画像有实质新增或修正时输出；必须使用 replace，并把仍成立的旧特征和新特征合并为一条完整、精炼的描述。单次玩笑、一次问答、具体事件和临时情绪不得写入沟通风格；没有实质变化时不要输出。
 5. 地区、饮食、职业等只接受主动透露的信息；{sensitive_rule}不得从语言、头像、时间或玩笑推断。
 6. 不要把当前平台昵称重复当成新别名；只有历史称呼、群友实际使用的称呼才放入 aliases。同一用户可以有多个不同昵称；同一个昵称由多人使用时，分别提供 called_by_user_id，但不要重复写入 relations。
-7. 每个昵称都必须给出实际包含该称呼的 call_line_ids。若依靠上下文判断目标，还必须给出目标本人随后自然回应的 target_response_line_ids；不要把只有第三人称描述、无人回应的称呼直接判定给批次中的某个用户。单纯在同一句中 @ 或引用某人，只能证明消息发给他，不能证明句中的昵称就是他；例如“星老师太吵了 @示例用户”不能据此把“星老师”归给示例用户。只有明确自称，或“以后叫你X / 你就是X”一类直接命名表达，才可作为强归属。attribution_type 只能是 explicit_at、reply、self_declaration、context_response 或 ambiguous。
-8. 每个事实必须给出 evidence_line_ids，且只能引用下面真实存在的 L 行；不能伪造行号。
-9. 具体称呼只写入 aliases；relations 不得使用“称呼”类型。其他关系按“方向相同的用户对 + relation_type”维护唯一的一条综合描述，确有变化时使用 replace，并在 value 中保留仍成立的旧关系信息。
-10. 对旧画像做去重和纠错：没有变化不要重复输出；发生明确变化时使用 replace 或 expire。replace 只在 value 已经包含该字段当前完整状态时使用。
-11. 输出必须简洁：每个 value 只写一条短结论或短语，建议不超过 24 个汉字，硬上限 40 个字符；最多保留一个关键信息点或两个紧密相关的信息点。
-12. value 只写画像结论，不要复述证据、时间线、原话、括号解释、置信度或“自述/提及/表示”等来源说明；证据由 evidence_line_ids 承担。近期状态和沟通风格尤其要去掉次要背景，关系描述控制在一句话内。
-13. replace 时将旧信息和新信息合并成同样简短的一条，不要不断累加细节。
-14. 只输出 JSON，不要解释，不要输出 Markdown 代码块，不要增加未列出的字段。
+7. 对旧画像中已经确认的昵称，只有本批新消息明确实际使用该昵称，且昵称归属唯一时，才放入 alias_activity；它只用于刷新该昵称的 last_seen，不用于发现新昵称。called_by_user_id 必须是实际发送该称呼的用户，无法确定时不要输出。
+8. 每个昵称都必须给出实际包含该称呼的 call_line_ids。若依靠上下文判断目标，还必须给出目标本人随后自然回应的 target_response_line_ids；不要把只有第三人称描述、无人回应的称呼直接判定给批次中的某个用户。单纯在同一句中 @ 或引用某人，只能证明消息发给他，不能证明句中的昵称就是他；例如“星老师太吵了 @示例用户”不能据此把“星老师”归给示例用户。只有明确自称，或“以后叫你X / 你就是X”一类直接命名表达，才可作为强归属。attribution_type 只能是 explicit_at、reply、self_declaration、context_response 或 ambiguous。
+9. 每个事实必须给出 evidence_line_ids，且只能引用下面真实存在的 L 行；不能伪造行号。
+10. 具体称呼只写入 aliases；relations 不得使用“称呼”类型。其他关系按“方向相同的用户对 + relation_type”维护唯一的一条综合描述，确有变化时使用 replace，并在 value 中保留仍成立的旧关系信息。
+11. 对旧画像做去重和纠错：没有变化不要重复输出；发生明确变化时使用 replace 或 expire。replace 只在 value 已经包含该字段当前完整状态时使用。
+12. 输出必须简洁：每个 value 只写一条短结论或短语，建议不超过 24 个汉字，硬上限 40 个字符；最多保留一个关键信息点或两个紧密相关的信息点。
+13. value 只写画像结论，不要复述证据、时间线、原话、括号解释、置信度或“自述/提及/表示”等来源说明；证据由 evidence_line_ids 承担。近期状态和沟通风格尤其要去掉次要背景，关系描述控制在一句话内。
+14. replace 时将旧信息和新信息合并成同样简短的一条，不要不断累加细节。
+15. alias_activity 也必须给出真实存在的 evidence_line_ids；证据行中必须实际包含该昵称。没有明确使用或归属有歧义时省略。
+16. 只输出 JSON，不要解释，不要输出 Markdown 代码块，不要增加未列出的字段。
 
 允许的画像字段：{field_text}
 
@@ -450,6 +452,9 @@ def build_summary_prompt(
   "aliases": [
     {{"target_user_id":"12345678","alias":"阿明","called_by_user_id":"22334455","attribution_type":"context_response","confidence":0.0,"call_line_ids":[2],"target_response_line_ids":[3]}}
   ],
+  "alias_activity": [
+    {{"target_user_id":"12345678","alias":"阿明","called_by_user_id":"22334455","evidence_line_ids":[2]}}
+  ],
   "relations": [
     {{"from_user_id":"12345678","to_user_id":"22334455","relation_type":"游戏搭档|经常互动|其他","action":"replace","value":"短关系描述","confidence":0.0,"evidence_line_ids":[2]}}
   ],
@@ -458,7 +463,7 @@ def build_summary_prompt(
   ]
 }}
 
-没有可确认的更新时输出：{{"facts":[],"aliases":[],"relations":[],"observations":[]}}"""
+没有可确认的更新时输出：{{"facts":[],"aliases":[],"alias_activity":[],"relations":[],"observations":[]}}"""
     return prompt[:max_prompt_chars]
 
 
@@ -492,7 +497,14 @@ def is_valid_model_result(raw: Any) -> bool:
         payload is not None
         and any(
             key in payload
-            for key in ("facts", "updates", "aliases", "relations", "observations")
+            for key in (
+                "facts",
+                "updates",
+                "aliases",
+                "alias_activity",
+                "relations",
+                "observations",
+            )
         )
     )
 
@@ -611,6 +623,7 @@ def parse_model_result(
         "facts": [],
         "aliases": [],
         "alias_candidates": [],
+        "alias_activity": [],
         "relations": [],
         "observations": [],
     }
@@ -779,6 +792,17 @@ def parse_model_result(
                 "target_user_id": target,
                 "alias": alias,
                 "called_by_user_id": called_by,
+                "attribution_type": (
+                    "self_declaration"
+                    if self_declaration
+                    else "explicit_at"
+                    if explicit_naming
+                    else "context_response"
+                    if context_responses
+                    else "reply"
+                    if addressed_target
+                    else "ambiguous"
+                ),
                 "confidence": confidence,
                 "call_line_ids": tuple(message.line_id for message in caller_calls),
                 "target_response_line_ids": tuple(
@@ -821,6 +845,57 @@ def parse_model_result(
         candidate_aliases.pop(key, None)
     result["aliases"].extend(confirmed_aliases.values())
     result["alias_candidates"].extend(candidate_aliases.values())
+
+    raw_alias_activity = payload.get("alias_activity", [])
+    if isinstance(raw_alias_activity, list) and "aliases" in allowed:
+        activity_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for item in raw_alias_activity[:max_items]:
+            if not isinstance(item, dict):
+                continue
+            target = normalize_user_id(item.get("target_user_id", item.get("user_id")))
+            alias = normalize_alias(item.get("alias", item.get("value", "")))
+            called_by = normalize_user_id(item.get("called_by_user_id")) or ""
+            evidence_ids = _evidence_lines(item, by_id)
+            canonical_alias = canonical_text(alias)
+            existing_targets = known_alias_targets.get(canonical_alias, set())
+            matching_calls = [
+                by_id[line_id]
+                for line_id in evidence_ids
+                if canonical_alias and canonical_alias in canonical_text(by_id[line_id].text)
+            ]
+            if not called_by and matching_calls:
+                speakers = {message.sender_id for message in matching_calls}
+                if len(speakers) == 1:
+                    called_by = next(iter(speakers))
+            caller_calls = [
+                message for message in matching_calls if message.sender_id == called_by
+            ]
+            if (
+                not target
+                or target not in known_users
+                or not alias
+                or existing_targets != {target}
+                or not evidence_ids
+                or not caller_calls
+                or not called_by
+                or called_by == target
+                or called_by not in known_users
+            ):
+                continue
+            parsed_activity = {
+                "target_user_id": target,
+                "alias": alias,
+                "called_by_user_id": called_by,
+                "evidence_line_ids": tuple(message.line_id for message in caller_calls),
+                "evidence": _evidence_text(
+                    [message.line_id for message in caller_calls], by_id
+                ),
+            }
+            key = (target, canonical_alias, called_by)
+            previous = activity_by_key.get(key)
+            if previous is None:
+                activity_by_key[key] = parsed_activity
+        result["alias_activity"].extend(activity_by_key.values())
 
     raw_relations = payload.get("relations", [])
     relations_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
