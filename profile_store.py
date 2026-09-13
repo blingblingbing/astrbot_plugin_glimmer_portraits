@@ -34,8 +34,14 @@ def _load_json(value: Any, default: Any) -> Any:
 class ProfileStore:
     """单个插件实例使用的 SQLite 存储。"""
 
-    def __init__(self, database_path: str | Path):
+    def __init__(
+        self, database_path: str | Path, *, observed_alias_ttl_days: int = 0
+    ):
         self.database_path = Path(database_path)
+        try:
+            self.observed_alias_ttl_days = max(0, int(observed_alias_ttl_days))
+        except (TypeError, ValueError):
+            self.observed_alias_ttl_days = 0
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(
             str(self.database_path), check_same_thread=False, timeout=30
@@ -331,7 +337,11 @@ class ProfileStore:
                         sum(int(row["occurrences"] or 0) for row in group),
                         min(int(row["first_seen"] or 0) for row in group),
                         max(int(row["last_seen"] or 0) for row in group),
-                        "platform" if any(row["source"] == "platform" for row in group) else "observed",
+                        "platform"
+                        if any(row["source"] == "platform" for row in group)
+                        else "explicit"
+                        if any(row["source"] == "explicit" for row in group)
+                        else "observed",
                         str(winner["evidence"] or ""),
                         int(winner["id"]),
                     ),
@@ -817,6 +827,52 @@ class ProfileStore:
             )
         return result
 
+    def archive_alias(self, scope: str, user_id: str, alias: str) -> dict[str, int]:
+        """归档指定用户的正式昵称及其候选记录，不物理删除历史数据。"""
+
+        scope = clean_text(scope, 200)
+        user_id = clean_text(user_id, 128)
+        normalized_alias = normalize_alias(alias)
+        canonical = canonical_text(normalized_alias or "")
+        result = {"aliases": 0, "alias_candidates": 0}
+        if not scope or not user_id or not canonical:
+            return result
+
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute("BEGIN")
+            cursor.execute(
+                """
+                UPDATE aliases SET status='archived'
+                WHERE scope = ? AND user_id = ? AND canonical_alias = ?
+                  AND status = 'active'
+                """,
+                (scope, user_id, canonical),
+            )
+            result["aliases"] = max(0, int(cursor.rowcount or 0))
+            cursor.execute(
+                """
+                UPDATE alias_candidates SET status='archived'
+                WHERE scope = ? AND user_id = ? AND canonical_alias = ?
+                  AND status IN ('pending', 'conflict')
+                """,
+                (scope, user_id, canonical),
+            )
+            result["alias_candidates"] = max(0, int(cursor.rowcount or 0))
+            if result["aliases"] or result["alias_candidates"]:
+                cursor.execute(
+                    """
+                    UPDATE profiles SET last_profile_update = ?
+                    WHERE scope = ? AND user_id = ?
+                    """,
+                    (_now(), scope, user_id),
+                )
+            self.connection.commit()
+            return result
+        except Exception:
+            self.connection.rollback()
+            raise
+
     def apply_result_and_consume(
         self,
         scope: str,
@@ -840,6 +896,7 @@ class ProfileStore:
             "facts": 0,
             "aliases": 0,
             "alias_candidates": 0,
+            "alias_activity": 0,
             "relations": 0,
             "observations": 0,
         }
@@ -869,6 +926,9 @@ class ProfileStore:
                 counts["alias_candidates"] += 1
                 if promoted:
                     counts["aliases"] += 1
+            for item in result.get("alias_activity", []) or []:
+                if self._apply_alias_activity_cursor(cursor, scope, item, now):
+                    counts["alias_activity"] += 1
             for item in result.get("relations", []) or []:
                 self._apply_relation_cursor(
                     cursor,
@@ -911,7 +971,7 @@ class ProfileStore:
             }
             affected_users.update(
                 str(item.get("target_user_id", ""))
-                for key in ("aliases", "alias_candidates")
+                for key in ("aliases", "alias_candidates", "alias_activity")
                 for item in result.get(key, []) or []
                 if str(item.get("target_user_id", ""))
             )
@@ -1088,6 +1148,16 @@ class ProfileStore:
                 """,
                 (now,),
             )
+            if self.observed_alias_ttl_days > 0:
+                cutoff = now - self.observed_alias_ttl_days * 86400
+                self.connection.execute(
+                    """
+                    UPDATE aliases SET status='expired'
+                    WHERE status = 'active' AND source = 'observed'
+                      AND last_seen > 0 AND last_seen <= ?
+                    """,
+                    (cutoff,),
+                )
             self.connection.commit()
         except Exception:
             self.connection.rollback()
@@ -1121,6 +1191,9 @@ class ProfileStore:
         alias = normalize_alias(alias)
         if not alias:
             return
+        source = clean_text(source, 20).lower()
+        if source not in {"platform", "explicit"}:
+            source = "observed"
         canonical = canonical_text(alias)
         if called_by_user_id:
             cursor.execute(
@@ -1159,14 +1232,18 @@ class ProfileStore:
                 """
                 UPDATE aliases
                 SET alias = ?,
-                    source = CASE WHEN source='platform' OR ?='platform'
-                                  THEN 'platform' ELSE 'observed' END,
+                    source = CASE
+                        WHEN source='platform' OR ?='platform' THEN 'platform'
+                        WHEN source='explicit' OR ?='explicit' THEN 'explicit'
+                        ELSE 'observed'
+                    END,
                     confidence = MAX(confidence, ?), occurrences = occurrences + 1,
                     last_seen = ?, evidence = ?, status = 'active'
                 WHERE id = ?
                 """,
                 (
                     alias,
+                    source,
                     source,
                     confidence,
                     now,
@@ -1282,12 +1359,20 @@ class ProfileStore:
         if not target or not alias:
             return
         called_by = clean_text(item.get("called_by_user_id", ""), 128)
+        attribution_type = clean_text(item.get("attribution_type", ""), 32).lower()
+        requested_source = clean_text(item.get("source", ""), 20).lower()
+        source = (
+            "explicit"
+            if requested_source == "explicit"
+            or attribution_type in {"self_declaration", "explicit_at"}
+            else "observed"
+        )
         self._upsert_alias_cursor(
             cursor,
             scope=scope,
             user_id=target,
             alias=alias,
-            source="observed",
+            source=source,
             called_by_user_id=called_by,
             confidence=float(item.get("confidence", 0) or 0),
             evidence=str(item.get("evidence", "") or ""),
@@ -1303,6 +1388,57 @@ class ProfileStore:
             """,
             (target, scope, canonical),
         )
+
+    def _apply_alias_activity_cursor(
+        self,
+        cursor: sqlite3.Cursor,
+        scope: str,
+        item: Mapping[str, Any],
+        now: int,
+    ) -> bool:
+        """刷新当前批次明确使用过的正式昵称的 last_seen。"""
+
+        target = clean_text(item.get("target_user_id", ""), 128)
+        alias = normalize_alias(item.get("alias", ""))
+        called_by = clean_text(item.get("called_by_user_id", ""), 128)
+        if not target or not alias:
+            return False
+        canonical = canonical_text(alias)
+        row = cursor.execute(
+            """
+            SELECT id, source, confidence FROM aliases
+            WHERE scope = ? AND user_id = ? AND canonical_alias = ?
+              AND status = 'active'
+            LIMIT 1
+            """,
+            (scope, target, canonical),
+        ).fetchone()
+        if row is None:
+            return False
+        evidence = clean_text(item.get("evidence", ""), 360)
+        if called_by:
+            self._upsert_alias_cursor(
+                cursor,
+                scope=scope,
+                user_id=target,
+                alias=alias,
+                source=str(row["source"] or "observed"),
+                called_by_user_id=called_by,
+                confidence=float(row["confidence"] or 0),
+                evidence=evidence,
+                now=now,
+            )
+        else:
+            cursor.execute(
+                """
+                UPDATE aliases
+                SET last_seen = ?, occurrences = occurrences + 1,
+                    evidence = ?
+                WHERE id = ? AND status = 'active'
+                """,
+                (now, evidence, int(row["id"])),
+            )
+        return True
 
     def _apply_alias_candidate_cursor(
         self,

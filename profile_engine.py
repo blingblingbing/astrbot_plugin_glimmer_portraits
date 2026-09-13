@@ -121,6 +121,41 @@ MULTI_VALUE_FIELDS = {
     "aliases",
 }
 
+INJECTION_FIELD_LABELS = {
+    "aliases": "称呼",
+    "interests": "兴趣",
+    "game_preferences": "游戏",
+    "occupation_or_study": "学习/职业",
+    "work_status": "工作",
+    "skills": "技能",
+    "software_preferences": "软件/设备",
+    "dietary_preferences": "饮食",
+    "coarse_location": "地区/时区",
+    "communication_style": "沟通",
+    "relations": "关系",
+    "recent_context": "近期",
+    "observations": "观察",
+}
+
+INJECTION_VALUE_LIMITS = {
+    "interests": 36,
+    "game_preferences": 36,
+    "occupation_or_study": 40,
+    "work_status": 32,
+    "skills": 36,
+    "software_preferences": 36,
+    "dietary_preferences": 32,
+    "coarse_location": 32,
+    "communication_style": 40,
+    "relations": 32,
+    "recent_context": 40,
+    "observations": 36,
+}
+
+INJECTION_MAX_FACT_LINES = 8
+INJECTION_MAX_OBSERVATION_LINES = 2
+INJECTION_MAX_RELATION_LINES = 2
+
 GENERIC_ALIASES = {
     "你",
     "我",
@@ -257,6 +292,40 @@ def _relation_markers(message: NumberedMessage) -> str:
     return f" [{' '.join(markers)}]" if markers else ""
 
 
+def _truncate_at_boundary(text: str, max_chars: int) -> str:
+    """在自然标点处截断短文本，尽量避免切断一个完整信息点。"""
+
+    limit = max(1, int(max_chars))
+    if len(text) <= limit:
+        return text
+    if limit == 1:
+        return text[:1]
+
+    head = text[: limit - 1].rstrip()
+    boundaries = "。！？；;，,、:："
+    boundary = max((head.rfind(mark) for mark in boundaries), default=-1)
+    if boundary >= max(4, int(limit * 0.55)):
+        head = head[: boundary + 1].rstrip("，,、；;:：")
+    return head.rstrip() + "…"
+
+
+def _compact_profile_value(field: str, value: Any, max_chars: int | None = None) -> str:
+    """将画像字段压缩成适合注入上下文的短摘要，不修改数据库原文。"""
+
+    limit = max_chars or INJECTION_VALUE_LIMITS.get(field, 36)
+    text = clean_text(value, 1000)
+    # 旧版本或模型偶尔会把证据、来源和置信度写进 value；这些信息不应重复注入。
+    text = re.sub(
+        r"[（(][^（）()]{0,80}(?:置信度|自述|据称|提及|表示|例如|比如|证据|来源|经历)[^（）()]{0,80}[）)]",
+        "",
+        text,
+    )
+    text = re.sub(r"[（(]\s*(?:高|中|低)?\s*置信度\s*[）)]", "", text)
+    text = text.replace("在本群表现为", "表现为")
+    text = re.sub(r"\s+", " ", text).strip(" ，,；;")
+    return _truncate_at_boundary(text, limit)
+
+
 def _render_old_profiles(old_profiles: Mapping[str, Mapping[str, Any]], max_chars: int) -> str:
     if not old_profiles:
         return "暂无涉及用户的旧画像。"
@@ -278,14 +347,22 @@ def _render_old_profiles(old_profiles: Mapping[str, Mapping[str, Any]], max_char
             "facts": [
                 {
                     "field": item.get("field", ""),
-                    "value": clean_text(item.get("value", ""), 160),
+                    "value": _compact_profile_value(
+                        str(item.get("field", "") or ""),
+                        item.get("value", ""),
+                        max_chars=80,
+                    ),
                     "confidence": round(float(item.get("confidence", 0) or 0), 2),
                 }
                 for item in profile.get("facts", [])
                 if item.get("status", "active") == "active"
             ][:16],
             "observations": [
-                clean_text(item.get("value", ""), 120)
+                _compact_profile_value(
+                    str(item.get("field", "observations") or "observations"),
+                    item.get("value", ""),
+                    max_chars=64,
+                )
                 for item in profile.get("observations", [])
                 if item.get("status", "active") == "active"
             ][:5],
@@ -294,7 +371,9 @@ def _render_old_profiles(old_profiles: Mapping[str, Mapping[str, Any]], max_char
                     "from_user_id": item.get("from_user_id", ""),
                     "to_user_id": item.get("to_user_id", ""),
                     "type": clean_text(item.get("relation_type", ""), 32),
-                    "value": clean_text(item.get("value", ""), 120),
+                    "value": _compact_profile_value(
+                        "relations", item.get("value", ""), max_chars=64
+                    ),
                 }
                 for item in profile.get("relations", [])
                 if item.get("status", "active") == "active"
@@ -346,11 +425,16 @@ def build_summary_prompt(
 4. 沟通风格是每位用户唯一的一条长期综合画像，不是本批聊天摘要。仅当本批至少两条消息共同提供稳定证据，且相较旧画像有实质新增或修正时输出；必须使用 replace，并把仍成立的旧特征和新特征合并为一条完整、精炼的描述。单次玩笑、一次问答、具体事件和临时情绪不得写入沟通风格；没有实质变化时不要输出。
 5. 地区、饮食、职业等只接受主动透露的信息；{sensitive_rule}不得从语言、头像、时间或玩笑推断。
 6. 不要把当前平台昵称重复当成新别名；只有历史称呼、群友实际使用的称呼才放入 aliases。同一用户可以有多个不同昵称；同一个昵称由多人使用时，分别提供 called_by_user_id，但不要重复写入 relations。
-7. 每个昵称都必须给出实际包含该称呼的 call_line_ids。若依靠上下文判断目标，还必须给出目标本人随后自然回应的 target_response_line_ids；不要把只有第三人称描述、无人回应的称呼直接判定给批次中的某个用户。单纯在同一句中 @ 或引用某人，只能证明消息发给他，不能证明句中的昵称就是他；例如“星老师太吵了 @示例用户”不能据此把“星老师”归给示例用户。只有明确自称，或“以后叫你X / 你就是X”一类直接命名表达，才可作为强归属。attribution_type 只能是 explicit_at、reply、self_declaration、context_response 或 ambiguous。
-8. 每个事实必须给出 evidence_line_ids，且只能引用下面真实存在的 L 行；不能伪造行号。
-9. 具体称呼只写入 aliases；relations 不得使用“称呼”类型。其他关系按“方向相同的用户对 + relation_type”维护唯一的一条综合描述，确有变化时使用 replace，并在 value 中保留仍成立的旧关系信息。
-10. 对旧画像做去重和纠错：没有变化不要重复输出；发生明确变化时使用 replace 或 expire。replace 只在 value 已经包含该字段当前完整状态时使用。
-11. 只输出 JSON，不要解释，不要输出 Markdown 代码块，不要增加未列出的字段。
+7. 对旧画像中已经确认的昵称，只有本批新消息明确实际使用该昵称，且昵称归属唯一时，才放入 alias_activity；它只用于刷新该昵称的 last_seen，不用于发现新昵称。called_by_user_id 必须是实际发送该称呼的用户，无法确定时不要输出。
+8. 每个昵称都必须给出实际包含该称呼的 call_line_ids。若依靠上下文判断目标，还必须给出目标本人随后自然回应的 target_response_line_ids；不要把只有第三人称描述、无人回应的称呼直接判定给批次中的某个用户。单纯在同一句中 @ 或引用某人，只能证明消息发给他，不能证明句中的昵称就是他；例如“星老师太吵了 @示例用户”不能据此把“星老师”归给示例用户。只有明确自称，或“以后叫你X / 你就是X”一类直接命名表达，才可作为强归属。attribution_type 只能是 explicit_at、reply、self_declaration、context_response 或 ambiguous。
+9. 每个事实必须给出 evidence_line_ids，且只能引用下面真实存在的 L 行；不能伪造行号。
+10. 具体称呼只写入 aliases；relations 不得使用“称呼”类型。其他关系按“方向相同的用户对 + relation_type”维护唯一的一条综合描述，确有变化时使用 replace，并在 value 中保留仍成立的旧关系信息。
+11. 对旧画像做去重和纠错：没有变化不要重复输出；发生明确变化时使用 replace 或 expire。replace 只在 value 已经包含该字段当前完整状态时使用。
+12. 输出必须简洁：每个 value 只写一条短结论或短语，建议不超过 24 个汉字，硬上限 40 个字符；最多保留一个关键信息点或两个紧密相关的信息点。
+13. value 只写画像结论，不要复述证据、时间线、原话、括号解释、置信度或“自述/提及/表示”等来源说明；证据由 evidence_line_ids 承担。近期状态和沟通风格尤其要去掉次要背景，关系描述控制在一句话内。
+14. replace 时将旧信息和新信息合并成同样简短的一条，不要不断累加细节。
+15. alias_activity 也必须给出真实存在的 evidence_line_ids；证据行中必须实际包含该昵称。没有明确使用或归属有歧义时省略。
+16. 只输出 JSON，不要解释，不要输出 Markdown 代码块，不要增加未列出的字段。
 
 允许的画像字段：{field_text}
 
@@ -363,20 +447,23 @@ def build_summary_prompt(
 输出格式：
 {{
   "facts": [
-    {{"user_id":"12345678","field":"interests","action":"add|replace|expire","value":"简短内容","confidence":0.0,"source":"explicit|repeated|observed","evidence_line_ids":[1]}}
+    {{"user_id":"12345678","field":"interests","action":"add|replace|expire","value":"短语，不超过40个字符","confidence":0.0,"source":"explicit|repeated|observed","evidence_line_ids":[1]}}
   ],
   "aliases": [
     {{"target_user_id":"12345678","alias":"阿明","called_by_user_id":"22334455","attribution_type":"context_response","confidence":0.0,"call_line_ids":[2],"target_response_line_ids":[3]}}
   ],
+  "alias_activity": [
+    {{"target_user_id":"12345678","alias":"阿明","called_by_user_id":"22334455","evidence_line_ids":[2]}}
+  ],
   "relations": [
-    {{"from_user_id":"12345678","to_user_id":"22334455","relation_type":"游戏搭档|经常互动|其他","action":"replace","value":"完整的综合描述","confidence":0.0,"evidence_line_ids":[2]}}
+    {{"from_user_id":"12345678","to_user_id":"22334455","relation_type":"游戏搭档|经常互动|其他","action":"replace","value":"短关系描述","confidence":0.0,"evidence_line_ids":[2]}}
   ],
   "observations": [
-    {{"user_id":"12345678","field":"communication_style","action":"replace","value":"在本群表现为……","confidence":0.0,"evidence_line_ids":[1,3]}}
+    {{"user_id":"12345678","field":"communication_style","action":"replace","value":"表现为……，不超过40个字符","confidence":0.0,"evidence_line_ids":[1,3]}}
   ]
 }}
 
-没有可确认的更新时输出：{{"facts":[],"aliases":[],"relations":[],"observations":[]}}"""
+没有可确认的更新时输出：{{"facts":[],"aliases":[],"alias_activity":[],"relations":[],"observations":[]}}"""
     return prompt[:max_prompt_chars]
 
 
@@ -410,7 +497,14 @@ def is_valid_model_result(raw: Any) -> bool:
         payload is not None
         and any(
             key in payload
-            for key in ("facts", "updates", "aliases", "relations", "observations")
+            for key in (
+                "facts",
+                "updates",
+                "aliases",
+                "alias_activity",
+                "relations",
+                "observations",
+            )
         )
     )
 
@@ -529,6 +623,7 @@ def parse_model_result(
         "facts": [],
         "aliases": [],
         "alias_candidates": [],
+        "alias_activity": [],
         "relations": [],
         "observations": [],
     }
@@ -697,6 +792,17 @@ def parse_model_result(
                 "target_user_id": target,
                 "alias": alias,
                 "called_by_user_id": called_by,
+                "attribution_type": (
+                    "self_declaration"
+                    if self_declaration
+                    else "explicit_at"
+                    if explicit_naming
+                    else "context_response"
+                    if context_responses
+                    else "reply"
+                    if addressed_target
+                    else "ambiguous"
+                ),
                 "confidence": confidence,
                 "call_line_ids": tuple(message.line_id for message in caller_calls),
                 "target_response_line_ids": tuple(
@@ -739,6 +845,57 @@ def parse_model_result(
         candidate_aliases.pop(key, None)
     result["aliases"].extend(confirmed_aliases.values())
     result["alias_candidates"].extend(candidate_aliases.values())
+
+    raw_alias_activity = payload.get("alias_activity", [])
+    if isinstance(raw_alias_activity, list) and "aliases" in allowed:
+        activity_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for item in raw_alias_activity[:max_items]:
+            if not isinstance(item, dict):
+                continue
+            target = normalize_user_id(item.get("target_user_id", item.get("user_id")))
+            alias = normalize_alias(item.get("alias", item.get("value", "")))
+            called_by = normalize_user_id(item.get("called_by_user_id")) or ""
+            evidence_ids = _evidence_lines(item, by_id)
+            canonical_alias = canonical_text(alias)
+            existing_targets = known_alias_targets.get(canonical_alias, set())
+            matching_calls = [
+                by_id[line_id]
+                for line_id in evidence_ids
+                if canonical_alias and canonical_alias in canonical_text(by_id[line_id].text)
+            ]
+            if not called_by and matching_calls:
+                speakers = {message.sender_id for message in matching_calls}
+                if len(speakers) == 1:
+                    called_by = next(iter(speakers))
+            caller_calls = [
+                message for message in matching_calls if message.sender_id == called_by
+            ]
+            if (
+                not target
+                or target not in known_users
+                or not alias
+                or existing_targets != {target}
+                or not evidence_ids
+                or not caller_calls
+                or not called_by
+                or called_by == target
+                or called_by not in known_users
+            ):
+                continue
+            parsed_activity = {
+                "target_user_id": target,
+                "alias": alias,
+                "called_by_user_id": called_by,
+                "evidence_line_ids": tuple(message.line_id for message in caller_calls),
+                "evidence": _evidence_text(
+                    [message.line_id for message in caller_calls], by_id
+                ),
+            }
+            key = (target, canonical_alias, called_by)
+            previous = activity_by_key.get(key)
+            if previous is None:
+                activity_by_key[key] = parsed_activity
+        result["alias_activity"].extend(activity_by_key.values())
 
     raw_relations = payload.get("relations", [])
     relations_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -866,6 +1023,130 @@ def _truncate(text: str, max_chars: int) -> str:
     return text[: max(0, max_chars - 1)].rstrip() + "…"
 
 
+def _compact_confidence(value: Any) -> str:
+    try:
+        confidence = float(value or 0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return "高" if confidence >= 0.82 else "中" if confidence >= 0.65 else "低"
+
+
+def _render_compact_injection_profile(
+    profile: Mapping[str, Any], *, max_chars: int
+) -> str:
+    """渲染短版注入画像，保留完整包裹标签并按行控制长度。"""
+
+    user_id = clean_text(profile.get("user_id", ""), 40)
+    prefix = [
+        "<group_profile>",
+        f"用户 uid={user_id} 的群内有限画像（仅供当前话题参考）：",
+    ]
+    suffix = ["仅在相关话题中参考，不主动暴露。", "</group_profile>"]
+    candidates: list[str] = []
+
+    aliases: list[str] = []
+    seen_aliases: set[str] = set()
+    for item in profile.get("aliases", []) or []:
+        if item.get("status", "active") != "active" or not item.get("alias"):
+            continue
+        value = clean_text(item.get("alias", ""), 20)
+        canonical = canonical_text(value)
+        if value and canonical not in seen_aliases:
+            seen_aliases.add(canonical)
+            aliases.append(value)
+    if aliases:
+        candidates.append("称呼：" + _truncate_at_boundary("、".join(aliases[:6]), 44))
+
+    facts = [
+        item
+        for item in profile.get("facts", []) or []
+        if item.get("status", "active") == "active" and item.get("value")
+    ]
+    facts.sort(
+        key=lambda item: (
+            -float(item.get("confidence", 0) or 0),
+            -int(item.get("last_seen", 0) or 0),
+        )
+    )
+    selected_facts: list[Mapping[str, Any]] = []
+    seen_fields: set[str] = set()
+    for item in facts:
+        field = normalize_field(item.get("field")) or str(item.get("field", "") or "")
+        if field and field not in seen_fields:
+            selected_facts.append(item)
+            seen_fields.add(field)
+        if len(selected_facts) >= INJECTION_MAX_FACT_LINES:
+            break
+    for item in facts:
+        if len(selected_facts) >= INJECTION_MAX_FACT_LINES:
+            break
+        if item not in selected_facts:
+            selected_facts.append(item)
+    for item in selected_facts:
+        field = normalize_field(item.get("field")) or str(item.get("field", "") or "")
+        value = _compact_profile_value(field, item.get("value", ""))
+        if not field or not value:
+            continue
+        label = INJECTION_FIELD_LABELS.get(field, FIELD_LABELS.get(field, field))
+        candidates.append(f"{label}：{value}（{_compact_confidence(item.get('confidence'))}）")
+
+    observations = [
+        item
+        for item in profile.get("observations", []) or []
+        if item.get("status", "active") == "active" and item.get("value")
+    ]
+    observations.sort(
+        key=lambda item: (
+            -float(item.get("confidence", 0) or 0),
+            -int(item.get("last_seen", 0) or 0),
+        )
+    )
+    for item in observations[:INJECTION_MAX_OBSERVATION_LINES]:
+        field = normalize_field(item.get("field")) or "observations"
+        value = _compact_profile_value(field, item.get("value", ""))
+        if value:
+            label = INJECTION_FIELD_LABELS.get(
+                field, FIELD_LABELS.get(field, "观察")
+            )
+            candidates.append(f"{label}：{value}")
+
+    relations = [
+        item
+        for item in profile.get("relations", []) or []
+        if item.get("status", "active") == "active" and item.get("value")
+    ]
+    relations.sort(
+        key=lambda item: (
+            -float(item.get("confidence", 0) or 0),
+            -int(item.get("last_seen", 0) or 0),
+        )
+    )
+    for item in relations[:INJECTION_MAX_RELATION_LINES]:
+        from_user = clean_text(item.get("from_user_id", ""), 24)
+        to_user = clean_text(item.get("to_user_id", ""), 24)
+        relation_type = clean_text(item.get("relation_type", "互动"), 16)
+        value = _compact_profile_value("relations", item.get("value", ""))
+        if value:
+            candidates.append(f"关系：{from_user}→{to_user}（{relation_type}）{value}")
+
+    active_period = render_active_period(profile.get("active_hours"))
+    if active_period:
+        candidates.append(f"活跃：{active_period}")
+
+    lines = prefix[:]
+    for candidate in candidates:
+        proposed = "\n".join(lines + [candidate] + suffix)
+        if len(proposed) <= max_chars:
+            lines.append(candidate)
+    result = "\n".join(lines + suffix)
+    if len(result) <= max_chars:
+        return result
+
+    # 正常配置下不会走到这里；保底时仍优先保留合法的 group_profile 包裹。
+    minimal = "\n".join(["<group_profile>", f"uid={user_id}", "</group_profile>"])
+    return minimal if len(minimal) <= max_chars else ""
+
+
 def render_profile(
     profile: Mapping[str, Any] | None,
     *,
@@ -876,6 +1157,9 @@ def render_profile(
 
     if not profile:
         return "暂无已确认画像。"
+
+    if injection:
+        return _render_compact_injection_profile(profile, max_chars=max_chars)
 
     user_id = clean_text(profile.get("user_id", ""), 80)
     display_name = clean_text(profile.get("display_name", ""), 40)

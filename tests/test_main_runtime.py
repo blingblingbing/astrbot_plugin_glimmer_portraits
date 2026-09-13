@@ -273,6 +273,8 @@ class MainRuntimeTests(unittest.TestCase):
         injected = request.extra_user_content_parts[0]
         self.assertIn("原神", injected.text)
         self.assertTrue(getattr(injected, "is_temp", False))
+        self.assertTrue(injected.text.endswith("</group_profile>"))
+        self.assertLessEqual(len(injected.text), 1400)
 
         async def collect(generator):
             return [item async for item in generator]
@@ -316,6 +318,47 @@ class MainRuntimeTests(unittest.TestCase):
         self.assertIsNone(
             self.plugin.store.get_profile("aiocqhttp:100", "12345678")
         )
+
+    def test_delete_alias_command_archives_one_alias(self):
+        first = _Event(
+            "12345678", "小明", "最近在玩原神", message_id="m-delete-1"
+        )
+        second = _Event(
+            "22334455",
+            "小红",
+            "以后叫你明哥",
+            message_id="m-delete-2",
+            components=[_Plain("以后叫你明哥"), _Reply("12345678")],
+        )
+        asyncio.run(self.plugin.capture_group_message(first))
+        asyncio.run(self.plugin.capture_group_message(second))
+        self.assertTrue(
+            asyncio.run(self.plugin._run_update("aiocqhttp:100", reason="test"))
+        )
+        self.assertTrue(
+            any(
+                item["alias"] == "明哥"
+                for item in self.plugin.store.get_profile(
+                    "aiocqhttp:100", "12345678"
+                )["aliases"]
+            )
+        )
+
+        async def collect(generator):
+            return [item async for item in generator]
+
+        command_event = _Event(
+            "99999999",
+            "管理员",
+            "/删除称呼 12345678 明哥",
+            message_id="delete-command",
+        )
+        result = asyncio.run(collect(self.plugin.command_delete_alias(command_event)))
+        self.assertIn("已移除用户 12345678 的称呼", result[0])
+        profile = self.plugin.store.get_profile("aiocqhttp:100", "12345678")
+        self.assertIsNotNone(profile)
+        assert profile is not None
+        self.assertFalse(any(item["alias"] == "明哥" for item in profile["aliases"]))
 
 
 if __name__ == "__main__":

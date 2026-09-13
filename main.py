@@ -48,7 +48,7 @@ from .profile_store import ProfileStore
 
 
 PLUGIN_NAME = "astrbot_plugin_glimmer_portraits"
-COMMAND_NAMES = ("群画像", "更新画像", "重置画像")
+COMMAND_NAMES = ("群画像", "更新画像", "重置画像", "删除称呼")
 QQ_ID_RE = re.compile(r"^[0-9]{5,20}$")
 MEDIA_PLACEHOLDER_RE = re.compile(
     r"\[(?:图片(?:内容)?|图像|image|动画表情|表情包?|贴纸|sticker|face|视频|video|语音|voice|音频|audio|文件|file)(?:\s*[:：,，][^\]]*)?\]",
@@ -262,7 +262,15 @@ class GlimmerPortraitsPlugin(Star):
         self.context = context
         self.config = config
         data_dir = Path(StarTools.get_data_dir(PLUGIN_NAME))
-        self.store = ProfileStore(data_dir / "group_profiles.sqlite3")
+        self.store = ProfileStore(
+            data_dir / "group_profiles.sqlite3",
+            observed_alias_ttl_days=_as_int(
+                _config_value(self.config, "observed_alias_ttl_days", 30),
+                30,
+                0,
+                3650,
+            ),
+        )
         self._update_tasks: dict[str, asyncio.Task[Any]] = {}
         self._group_locks: dict[str, asyncio.Lock] = {}
         self._scheduler_task: asyncio.Task[Any] | None = None
@@ -500,8 +508,8 @@ class GlimmerPortraitsPlugin(Star):
                         _config_value(self.config, "observation_ttl_days", 90), 90, 0, 3650
                     ),
                     alias_candidate_ttl_days=_as_int(
-                        _config_value(self.config, "alias_candidate_ttl_days", 30),
-                        30,
+                        _config_value(self.config, "alias_candidate_ttl_days", 14),
+                        14,
                         1,
                         3650,
                     ),
@@ -526,13 +534,14 @@ class GlimmerPortraitsPlugin(Star):
                 )
                 self.store.mark_success(scope)
                 logger.info(
-                    "[GlimmerPortraits] 群画像总结完成 scope=%s reason=%s messages=%s facts=%s aliases=%s alias_candidates=%s relations=%s observations=%s",
+                    "[GlimmerPortraits] 群画像总结完成 scope=%s reason=%s messages=%s facts=%s aliases=%s alias_candidates=%s alias_activity=%s relations=%s observations=%s",
                     scope,
                     reason,
                     len(pending),
                     counts["facts"],
                     counts["aliases"],
                     counts["alias_candidates"],
+                    counts["alias_activity"],
                     counts["relations"],
                     counts["observations"],
                 )
@@ -614,6 +623,10 @@ class GlimmerPortraitsPlugin(Star):
         per_user_chars = _as_int(
             _config_value(self.config, "injection_max_chars_per_user", 500), 500, 120, 3000
         )
+        total_limit = _as_int(
+            _config_value(self.config, "injection_max_total_chars", 1400), 1400, 200, 12000
+        )
+        used_chars = 0
         for user_id in user_ids[:max_users]:
             profile = profiles.get(user_id)
             if not profile:
@@ -624,17 +637,22 @@ class GlimmerPortraitsPlugin(Star):
                 for key in ("facts", "observations", "relations", "aliases")
             ):
                 continue
-            rendered.append(
-                render_profile(profile, max_chars=per_user_chars, injection=True)
+            separator_chars = 1 if rendered else 0
+            remaining_chars = total_limit - used_chars - separator_chars
+            if remaining_chars <= 0:
+                break
+            rendered_profile = render_profile(
+                profile,
+                max_chars=min(per_user_chars, remaining_chars),
+                injection=True,
             )
+            if not rendered_profile or len(rendered_profile) > remaining_chars:
+                continue
+            rendered.append(rendered_profile)
+            used_chars += separator_chars + len(rendered_profile)
         if not rendered:
             return
-        total_limit = _as_int(
-            _config_value(self.config, "injection_max_total_chars", 1400), 1400, 200, 12000
-        )
         text = "\n".join(rendered)
-        if len(text) > total_limit:
-            text = text[: max(0, total_limit - 1)].rstrip() + "…"
         part = _make_temp_text_part(text)
         parts = getattr(req, "extra_user_content_parts", None)
         if isinstance(parts, list):
@@ -738,6 +756,35 @@ class GlimmerPortraitsPlugin(Star):
             yield event.plain_result(
                 f"✅ 已排队更新当前群画像，待处理消息：{pending}。完成后会写入 SQLite。"
             )
+
+    @filter.permission_type(PermissionType.ADMIN)
+    @filter.command("删除称呼")
+    async def command_delete_alias(self, event: AstrMessageEvent, args: str = ""):
+        """归档当前群中指定用户的一条称呼及其未晋升候选。"""
+
+        scoped = self._scope(event)
+        if scoped is None:
+            yield event.plain_result("❌ 请在群聊中使用此指令。")
+            return
+        _, group_id, scope = scoped
+        if not self._group_allowed(group_id):
+            yield event.plain_result("❌ 此群未启用群画像。")
+            return
+        tail = self._command_tail(event, "删除称呼", args)
+        parts = tail.split(maxsplit=1)
+        if len(parts) != 2 or not QQ_ID_RE.fullmatch(parts[0]) or not parts[1].strip():
+            yield event.plain_result("用法：/删除称呼 <QQ号> <昵称>")
+            return
+        target, alias = parts[0], parts[1].strip()
+        lock = self._group_locks.setdefault(scope, asyncio.Lock())
+        async with lock:
+            counts = self.store.archive_alias(scope, target, alias)
+        if not counts["aliases"] and not counts["alias_candidates"]:
+            yield event.plain_result(f"当前群未找到用户 {target} 的称呼「{clean_text(alias, 40)}」。")
+            return
+        yield event.plain_result(
+            f"✅ 已移除用户 {target} 的称呼「{clean_text(alias, 40)}」。"
+        )
 
     def _reset_confirmation_key(self, scope: str, event: Any, target: str) -> tuple[str, str, str]:
         return scope, self._admin_id(event), target
