@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import json
 import sys
 import time
 import unittest
@@ -360,6 +361,69 @@ class ProfileStoreTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.store.close()
         self.temp_dir.cleanup()
+
+    def test_self_alias_requires_other_users_to_confirm(self) -> None:
+        def parse_call(text, sender="12345678", reply="", response=False):
+            messages = [{"id": 1, "sender_id": sender, "text": text, "reply_user_id": reply}]
+            if response:
+                messages.append({"id": 2, "sender_id": "12345678", "text": "来了"})
+            raw = json.dumps({"aliases": [{
+                "target_user_id": "12345678", "alias": "小饼",
+                "called_by_user_id": sender, "confidence": 0.95,
+                "call_line_ids": [1],
+                "target_response_line_ids": [2] if response else [],
+            }]})
+            return parse_model_result(raw, number_messages(messages), ["aliases"])
+
+        for text in ("我是小饼", "我叫小饼", "我不是小饼", "扮演小饼"):
+            result = parse_call(text)
+            self.assertEqual(result["aliases"], [])
+            self.assertEqual(result["alias_candidates"], [])
+
+        self_result = parse_call("以后叫我小饼")
+        self.assertEqual(self_result["aliases"], [])
+        self.assertEqual(self_result["alias_candidates"][0]["attribution_strength"], "self")
+        for _ in range(3):
+            counts = self.store.apply_result_and_consume("qq:100", [], self_result)
+            self.assertEqual(counts["aliases"], 0)
+        candidate = self.store.connection.execute(
+            "SELECT context_confirmations,callers_json FROM alias_candidates"
+        ).fetchone()
+        self.assertEqual(candidate["context_confirmations"], 0)
+        self.assertEqual(json.loads(candidate["callers_json"]), [])
+
+        other_result = parse_call("小饼来吗", sender="22334455", response=True)
+        first = self.store.apply_result_and_consume("qq:100", [], other_result)
+        self.assertEqual(first["aliases"], 0)
+        second = self.store.apply_result_and_consume("qq:100", [], other_result)
+        self.assertEqual(second["aliases"], 1)
+        alias = self.store.connection.execute(
+            "SELECT source FROM aliases WHERE status='active'"
+        ).fetchone()
+        self.assertEqual(alias["source"], "observed")
+        self.store.observed_alias_ttl_days = 30
+        self.store.connection.execute(
+            "UPDATE aliases SET last_seen=?", (int(time.time()) - 31 * 86400,)
+        )
+        self.store.connection.commit()
+        self.store.expire_stale()
+        self.assertEqual(self.store.connection.execute(
+            "SELECT status FROM aliases"
+        ).fetchone()["status"], "expired")
+
+    def test_direct_naming_is_observed_not_permanent(self) -> None:
+        messages = number_messages([{
+            "id": 1, "sender_id": "22334455", "text": "以后叫你小饼",
+            "mentioned_user_ids": ["12345678"],
+        }])
+        result = parse_model_result(json.dumps({"aliases": [{
+            "target_user_id": "12345678", "alias": "小饼",
+            "called_by_user_id": "22334455", "confidence": 0.9, "call_line_ids": [1],
+        }]}), messages, ["aliases"])
+        self.store.apply_result_and_consume("qq:100", [], result)
+        self.assertEqual(self.store.connection.execute(
+            "SELECT source FROM aliases WHERE status='active'"
+        ).fetchone()["source"], "observed")
 
     def test_pending_messages_old_profile_and_atomic_consume(self) -> None:
         inserted, pending = self.store.add_message(
@@ -829,7 +893,7 @@ class ProfileStoreTests(unittest.TestCase):
         ).fetchone()[0]
         self.assertEqual(status, "conflict")
 
-    def test_observed_alias_expires_but_explicit_alias_does_not(self) -> None:
+    def test_model_aliases_expire_including_self_declaration(self) -> None:
         self.store.add_message(
             scope="qq:100",
             platform="qq",
@@ -878,13 +942,13 @@ class ProfileStoreTests(unittest.TestCase):
         assert profile is not None
         active_aliases = {item["alias"] for item in profile["aliases"]}
         self.assertNotIn("旧称呼", active_aliases)
-        self.assertIn("自称称呼", active_aliases)
+        self.assertNotIn("自称称呼", active_aliases)
         statuses = self.store.connection.execute(
             "SELECT alias,status FROM aliases WHERE canonical_alias IN ('旧称呼','自称称呼')"
         ).fetchall()
         self.assertEqual(
             {row["alias"]: row["status"] for row in statuses},
-            {"旧称呼": "expired", "自称称呼": "active"},
+            {"旧称呼": "expired", "自称称呼": "expired"},
         )
 
     def test_alias_activity_updates_last_seen(self) -> None:
