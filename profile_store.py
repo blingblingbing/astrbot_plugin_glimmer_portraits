@@ -1359,14 +1359,8 @@ class ProfileStore:
         if not target or not alias:
             return
         called_by = clean_text(item.get("called_by_user_id", ""), 128)
-        attribution_type = clean_text(item.get("attribution_type", ""), 32).lower()
-        requested_source = clean_text(item.get("source", ""), 20).lower()
-        source = (
-            "explicit"
-            if requested_source == "explicit"
-            or attribution_type in {"self_declaration", "explicit_at"}
-            else "observed"
-        )
+        # 模型提取的社交称呼都按实际使用时间过期，不因自称或直接命名永久保留。
+        source = "observed"
         self._upsert_alias_cursor(
             cursor,
             scope=scope,
@@ -1454,7 +1448,7 @@ class ProfileStore:
         alias = normalize_alias(item.get("alias", ""))
         called_by = clean_text(item.get("called_by_user_id", ""), 128)
         strength = clean_text(item.get("attribution_strength", "weak"), 20)
-        if not target or not alias or strength not in {"anchored", "context", "weak"}:
+        if not target or not alias or strength not in {"anchored", "context", "weak", "self"}:
             return False
         canonical = canonical_text(alias)
         existing = cursor.execute(
@@ -1468,10 +1462,12 @@ class ProfileStore:
         if not isinstance(callers, list):
             callers = []
         callers = [str(value) for value in callers if str(value)]
-        if called_by and called_by not in callers:
+        if called_by and called_by != target and called_by not in callers:
             callers.append(called_by)
-        context_increment = 1 if strength in {"anchored", "context"} else 0
-        weak_increment = 1 if strength == "weak" else 0
+        context_increment = (
+            1 if called_by and called_by != target and strength in {"anchored", "context"} else 0
+        )
+        weak_increment = 1 if strength in {"weak", "self"} else 0
         cursor.execute(
             """
             INSERT INTO alias_candidates

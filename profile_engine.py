@@ -424,9 +424,9 @@ def build_summary_prompt(
 3. 用户自述或明确表达优先；重复稳定偏好可以记录；沟通风格只能写成“在本群表现为……”的观察，不能生成绝对性格、MBTI 或诊断。
 4. 沟通风格是每位用户唯一的一条长期综合画像，不是本批聊天摘要。仅当本批至少两条消息共同提供稳定证据，且相较旧画像有实质新增或修正时输出；必须使用 replace，并把仍成立的旧特征和新特征合并为一条完整、精炼的描述。单次玩笑、一次问答、具体事件和临时情绪不得写入沟通风格；没有实质变化时不要输出。
 5. 地区、饮食、职业等只接受主动透露的信息；{sensitive_rule}不得从语言、头像、时间或玩笑推断。
-6. 不要把当前平台昵称重复当成新别名；只有历史称呼、群友实际使用的称呼才放入 aliases。同一用户可以有多个不同昵称；同一个昵称由多人使用时，分别提供 called_by_user_id，但不要重复写入 relations。
+6. 不要把当前平台昵称重复当成新别名；只有历史称呼、群友实际使用的称呼才放入 aliases。同一用户可以有多个不同昵称；同一个昵称由多人使用时，分别提供 called_by_user_id，但不要重复写入 relations。禁止添加侮辱性、辱骂性、贬损性或歧视性的昵称（例如“傻逼”）；即使群友反复使用、互相开玩笑、互骂、明确命名或本人自称，也不得写入 aliases，不得通过 alias_activity 刷新此类称呼，也不得将其作为称呼转写到 facts、observations 或 relations。
 7. 对旧画像中已经确认的昵称，只有本批新消息明确实际使用该昵称，且昵称归属唯一时，才放入 alias_activity；它只用于刷新该昵称的 last_seen，不用于发现新昵称。called_by_user_id 必须是实际发送该称呼的用户，无法确定时不要输出。
-8. 每个昵称都必须给出实际包含该称呼的 call_line_ids。若依靠上下文判断目标，还必须给出目标本人随后自然回应的 target_response_line_ids；不要把只有第三人称描述、无人回应的称呼直接判定给批次中的某个用户。单纯在同一句中 @ 或引用某人，只能证明消息发给他，不能证明句中的昵称就是他；例如“星老师太吵了 @示例用户”不能据此把“星老师”归给示例用户。只有明确自称，或“以后叫你X / 你就是X”一类直接命名表达，才可作为强归属。attribution_type 只能是 explicit_at、reply、self_declaration、context_response 或 ambiguous。
+8. 每个昵称都必须给出实际包含该称呼的 call_line_ids。若依靠上下文判断目标，还必须给出目标本人随后自然回应的 target_response_line_ids；不要把只有第三人称描述、无人回应的称呼直接判定给批次中的某个用户。单纯在同一句中 @ 或引用某人，只能证明消息发给他，不能证明句中的昵称就是他；例如“星老师太吵了 @示例用户”不能据此把“星老师”归给示例用户。“我是X / 我叫X”不能直接证明群内昵称；身份、职业、角色扮演、自嘲和玩笑不得作为昵称输出。“叫我X / 我的昵称是X / 我的网名是X”等明确称呼意愿只作为 self_declaration 候选，重复自称不算归属确认；必须等待其他群友实际使用并确认归属后才可晋升。其他群友“以后叫你X”一类直接命名可以作为强归属，但仍受昵称有效期管理。attribution_type 只能是 explicit_at、reply、self_declaration、context_response 或 ambiguous。
 9. 每个事实必须给出 evidence_line_ids，且只能引用下面真实存在的 L 行；不能伪造行号。
 10. 具体称呼只写入 aliases；relations 不得使用“称呼”类型。其他关系按“方向相同的用户对 + relation_type”维护唯一的一条综合描述，确有变化时使用 replace，并在 value 中保留仍成立的旧关系信息。
 11. 对旧画像做去重和纠错：没有变化不要重复输出；发生明确变化时使用 replace 或 expire。replace 只在 value 已经包含该字段当前完整状态时使用。
@@ -758,7 +758,7 @@ def parse_model_result(
                 message.sender_id == target
                 and any(
                     phrase + canonical_alias in canonical_text(message.text)
-                    for phrase in ("我是", "我叫", "叫我", "喊我", "可以叫我")
+                    for phrase in ("叫我", "喊我", "我的昵称是", "我的网名是")
                 )
                 for message in caller_calls
             )
@@ -788,6 +788,9 @@ def parse_model_result(
             ]
             existing_targets = known_alias_targets.get(canonical_alias, set())
             existing_unique = existing_targets == {target}
+            # 本人重复自称不能代替其他群友实际使用；普通身份描述不收为昵称。
+            if called_by == target and not self_declaration:
+                continue
             parsed_alias = {
                 "target_user_id": target,
                 "alias": alias,
@@ -820,9 +823,9 @@ def parse_model_result(
                     by_id,
                 ),
             }
-            if explicit_naming or self_declaration or existing_unique:
+            if called_by != target and (explicit_naming or existing_unique):
                 parsed_alias["attribution_strength"] = (
-                    "strong" if explicit_naming or self_declaration else "existing"
+                    "strong" if explicit_naming else "existing"
                 )
                 key = (target, canonical_alias)
                 previous = confirmed_aliases.get(key)
@@ -830,7 +833,9 @@ def parse_model_result(
                     confirmed_aliases[key] = parsed_alias
             else:
                 parsed_alias["attribution_strength"] = (
-                    "anchored"
+                    "self"
+                    if self_declaration and called_by == target
+                    else "anchored"
                     if addressed_target
                     else "context"
                     if context_responses
